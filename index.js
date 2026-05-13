@@ -443,7 +443,7 @@ async function sincronizarGrupo(dias = 7) {
     console.log(`[SINC] Processando msg ${m.id} tipo=${mimeType} foto=${hasPhoto} sender=${m.senderId}`);
 
     try {
-      const buffer = await userbotClient.downloadMedia(m, { outputFile: Buffer });
+      const buffer = await userbotClient.downloadMedia(m, {});
       if (!buffer || buffer.length === 0) { console.log(`[SINC] Buffer vazio msg ${m.id}`); continue; }
 
       const desvio = await parseDocument(buffer, mimeType);
@@ -544,7 +544,7 @@ async function startUserbot() {
       console.log(`[USERBOT] Mídia recebida: "${fileName}" (${mimeType}) de sender ${message.senderId}`);
 
       // Download
-      const buffer = await client.downloadMedia(message, { outputFile: Buffer });
+      const buffer = await client.downloadMedia(message, {});
       if (!buffer || buffer.length === 0) {
         console.error('[USERBOT] Buffer vazio ao baixar mídia');
         return;
