@@ -102,57 +102,124 @@ function isRelatorioDesvio(text) {
   return matches >= 3; // precisa ter pelo menos 3 palavras-chave
 }
 
-// ─── PDF Parser ───────────────────────────────────────────────────────────────
-function extractField(text, label) {
-  // Tenta capturar o valor após o rótulo, até a próxima linha não-vazia
-  const regex = new RegExp(label + '[\\s\\n]+([^\\n]+(?:\\n(?![A-Z]{3})[^\\n]+)*)', 'i');
-  const m = text.match(regex);
-  return m ? m[1].replace(/\s+/g, ' ').trim() : null;
+// ─── Parser robusto para OCR de imagem de formulário ─────────────────────────
+
+// Extrai primeiro match de um padrão, retorna '—' se não achar
+function ocr(text, ...patterns) {
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m) {
+      const val = (m[1] || m[0]).replace(/\s+/g, ' ').trim();
+      if (val.length > 1) return val;
+    }
+  }
+  return '—';
 }
 
-function parseDesvioId(text) {
-  const m = text.match(/Identifica[çc][aã]o[:\s]+([A-Z]{2}-\d+)/i);
-  return m ? m[1] : `DI-${Date.now().toString().slice(-6)}`;
+// Limpa valor OCR — remove sequências de ruído (letras isoladas, símbolos)
+function clean(val) {
+  if (!val || val === '—') return '—';
+  // Remove tokens com menos de 2 chars que não são números
+  const cleaned = val.replace(/\b[A-Za-z]\b/g, '').replace(/\s{2,}/g, ' ').trim();
+  return cleaned.length > 2 ? cleaned : '—';
 }
 
 function parseDesvioFromText(text) {
-  const get = (label) => extractField(text, label);
+  const T = text.toUpperCase();
 
-  // Extrai campos principais
-  const id          = parseDesvioId(text);
-  const evento      = get('EVENTO') || get('1\\s+EVENTO') || get('EVENTO 1');
-  const placa       = get('PLACA')  || get('PLACA 2');
-  const motorista   = get('NOME DO MOTORISTA[/A-Z ]*QUE COMETEU') || get('MOTORISTA[/\\w ]+DESVIO');
-  const dataDesvio  = get('DATA DO DESVIO');
-  const horario     = get('HOR[ÁA]RIO DO DESVIO');
-  const turno       = get('TURNO');
-  const reincidente = get('MOTORISTA REINCIDENTE');
-  const unidade     = get('UNIDADE');
-  const supervisor  = get('SUPERVISOR');
-  const gravidade   = get('GRAVIDADE DO DESVIO');
-  const descricao   = get('DESCRI[ÇC][ÃA]O DE EVENTO');
-  const analise     = get('AN[ÁA]LISE');
-  const autor       = get('Autor');
-  const respondente = get('Respondente');
-  const dataResp    = get('Data de Resposta');
+  // ── ID ──────────────────────────────────────────────────────────────────────
+  const id = ocr(text,
+    /(?:Identifica[çc][aã]o|ID)[:\s]+([A-Z]{2}-\d+)/i,
+    /\b(DI-\d{3,})\b/i
+  );
+  const idFinal = id !== '—' ? id.toUpperCase() : `DI-${Date.now().toString().slice(-6)}`;
+
+  // ── DATA (ISO sobrevive bem ao OCR) ──────────────────────────────────────────
+  const dataDesvio = ocr(text,
+    /DATA\s*(?:DO\s*)?DESVIO[^\d]*(202\d-\d{2}-\d{2})/i,
+    /\b(202\d-\d{2}-\d{2})\b/
+  );
+
+  // ── HORÁRIO ──────────────────────────────────────────────────────────────────
+  const horario = ocr(text, /\b(\d{2}:\d{2})\b/);
+
+  // ── TURNO ────────────────────────────────────────────────────────────────────
+  const turno = ocr(text, /\b(NOTURNO|DIURNO|MATUTINO|VESPERTINO)\b/i);
+
+  // ── EVENTO (busca palavras-chave conhecidas) ──────────────────────────────────
+  const eventosConhecidos = ['FADIGA', 'SONOLÊNCIA', 'SONOLENCIA', 'DISTRAÇÃO', 'DISTRACAO',
+    'DORMINDO', 'VELOCIDADE', 'CELULAR', 'CINTO', 'ABASTECIMENTO', 'MANUTENÇÃO'];
+  let evento = '—';
+  for (const e of eventosConhecidos) {
+    if (T.includes(e)) { evento = e.replace('SONOLENCIA','SONOLÊNCIA').replace('DISTRACAO','DISTRAÇÃO').replace('MANUTENCAO','MANUTENÇÃO'); break; }
+  }
+  // fallback: linha após "EVENTO" ou "DESCRIÇÃO DE EVENTO"
+  if (evento === '—') {
+    evento = ocr(text,
+      /DESCRI[ÇC][ÃA]O\s*DE\s*EVENTO\s*[\n\r]+([^\n\r]{5,60})/i,
+      /\bEVENTO\b[^\n]{0,10}\n([^\n]{5,60})/i
+    );
+  }
+
+  // ── GRAVIDADE ─────────────────────────────────────────────────────────────────
+  const gravidade = ocr(text, /\b(ALTA|M[ÉE]DIA|BAIXA|CR[ÍI]TICA)\b/i);
+
+  // ── PLACA ─────────────────────────────────────────────────────────────────────
+  const placa = ocr(text,
+    /PLACA[^\n]{0,20}\n([A-Z0-9\-]{5,12})/i,
+    /\b([A-Z]{2,4}[\d]{3,4}[A-Z\d]{0,4})\b/
+  );
+
+  // ── MOTORISTA ────────────────────────────────────────────────────────────────
+  // Nomes próprios: 2-5 palavras capitalizadas, cada uma com >=2 chars
+  let motorista = ocr(text,
+    /(?:NOME DO MOTORISTA|AJUDANTE QUE COMETEU)[^\n]*\n([A-ZÁÉÍÓÚÀÃÕÂÊÔÇÑ][a-záéíóúàãõâêôçñ]+(?: [A-ZÁÉÍÓÚÀÃÕÂÊÔÇÑ][a-záéíóúàãõâêôçñ]+){1,4})/i,
+    /(?:MOTORISTA|CONDUTOR)[^\n]{0,30}\n([A-Z][a-z]+(?: [A-Z][a-z]+){1,4})/i
+  );
+  // fallback: nome em CAIXA ALTA de 2-5 palavras
+  if (motorista === '—') {
+    const capsName = text.match(/\b([A-ZÁÉÍÓÚÀÃÕÂÊÔÇ]{2,}\s+[A-ZÁÉÍÓÚÀÃÕÂÊÔÇ]{2,}(?:\s+[A-ZÁÉÍÓÚÀÃÕÂÊÔÇ]{2,}){0,3})\b/);
+    if (capsName) motorista = capsName[1].trim();
+  }
+
+  // ── REINCIDENTE ───────────────────────────────────────────────────────────────
+  const reincidente = ocr(text, /REINCIDENTE[^\n]*(SIM|N[ÃA]O)/i);
+
+  // ── UNIDADE ───────────────────────────────────────────────────────────────────
+  const unidade = ocr(text,
+    /UNIDADE[^\n]*\n([A-Z][A-Z\s]{3,30})/i,
+    /\b(SEACREST|BENELLOG|BNL)[^\n]{0,20}/i
+  );
+
+  // ── SUPERVISOR ────────────────────────────────────────────────────────────────
+  const supervisor = ocr(text,
+    /SUPERVISOR[^\n]*\n([A-ZÁÉÍÓÚÀÃÕÂÊÔÇ][a-záéíóúàãõâêôç]+(?: [A-ZÁÉÍÓÚÀÃÕÂÊÔÇ][a-záéíóúàãõâêôç]+){0,3})/i,
+    /SUPERVISOR[:\s]+([A-Z][a-z]+(?: [A-Z][a-z]+){0,3})/i
+  );
+
+  // ── ANÁLISE (bloco de texto longo) ────────────────────────────────────────────
+  const analise = ocr(text,
+    /AN[ÁA]LISE\s*[\n\r]+(.{40,600}?)(?:\n\n|\d{2}\/\d{2}|\d{4}-\d{2}|$)/is,
+    /AN[ÁA]LISE[:\s]+(.{40,400})/is
+  );
 
   return {
-    id,
-    evento:      evento      || '—',
-    placa:       placa       || '—',
-    motorista:   motorista   || '—',
-    dataDesvio:  dataDesvio  || '—',
-    horario:     horario     || '—',
-    turno:       turno       || '—',
-    reincidente: reincidente || '—',
-    unidade:     unidade     || '—',
-    supervisor:  supervisor  || '—',
-    gravidade:   gravidade   || '—',
-    descricao:   descricao   || '—',
-    analise:     analise     || '—',
-    autor:       autor       || '—',
-    respondente: respondente || '—',
-    dataResposta: dataResp   || '—',
+    id:          idFinal,
+    evento,
+    placa:       clean(placa),
+    motorista:   clean(motorista),
+    dataDesvio,
+    horario,
+    turno,
+    reincidente,
+    unidade:     clean(unidade),
+    supervisor:  clean(supervisor),
+    gravidade,
+    descricao:   evento,
+    analise:     analise !== '—' ? analise.replace(/\s+/g, ' ').trim().slice(0, 500) : '—',
+    autor:       '—',
+    respondente: '—',
+    dataResposta: '—',
     status:      'PENDENTE',
     criadoEm:    new Date().toISOString(),
     rawText:     text,
@@ -252,24 +319,25 @@ bot.on('message', async (msg) => {
     const tratativas  = list.filter(d => d.status === 'EM_TRATATIVA');
     const concluidos  = list.filter(d => d.status === 'CONCLUIDO');
 
+    const linha = (d) => {
+      const nome = d.motorista !== '—' ? d.motorista : '(nome não extraído)';
+      const evt  = d.evento    !== '—' ? d.evento    : '';
+      const data = d.dataDesvio !== '—' ? d.dataDesvio : d.criadoEm?.slice(0,10) || '';
+      return `  • \`${d.id}\` ${nome}${evt ? ' | ' + evt : ''}${data ? ' | ' + data : ''}\n`;
+    };
+
     let msg = `📋 *Desvios*\n\n`;
     if (pendentes.length) {
       msg += `🔴 *Pendentes (${pendentes.length}):*\n`;
-      pendentes.forEach(d => {
-        msg += `  • \`${d.id}\` — ${d.motorista} | ${d.evento} | ${d.dataDesvio}\n`;
-      });
+      pendentes.forEach(d => { msg += linha(d); });
     }
     if (tratativas.length) {
       msg += `\n🟡 *Em Tratativa (${tratativas.length}):*\n`;
-      tratativas.forEach(d => {
-        msg += `  • \`${d.id}\` — ${d.motorista} | ${d.evento}\n`;
-      });
+      tratativas.forEach(d => { msg += linha(d); });
     }
     if (concluidos.length) {
       msg += `\n✅ *Concluídos (${concluidos.length}):*\n`;
-      concluidos.slice(-5).forEach(d => {
-        msg += `  • \`${d.id}\` — ${d.motorista}\n`;
-      });
+      concluidos.slice(-5).forEach(d => { msg += linha(d); });
     }
     await bot.sendMessage(MY_CHAT_ID, msg, { parse_mode: 'Markdown' });
     return;
