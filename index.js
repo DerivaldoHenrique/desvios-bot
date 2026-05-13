@@ -204,6 +204,49 @@ bot.on('message', async (msg) => {
     return;
   }
 
+  // DD/MM/YYYY — desvios da data
+  const dateMatch = text.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (dateMatch) {
+    const [, dd, mm, yyyy] = dateMatch;
+    // Monta variações do formato que pode vir do PDF (2026-05-12, 13/05/2026, 2026/05/13...)
+    const isoDate   = `${yyyy}-${mm}-${dd}`;   // 2026-05-12
+    const brDate    = `${dd}/${mm}/${yyyy}`;    // 12/05/2026
+    const brDate2   = `${dd}/${mm}`;            // 12/05 (parcial)
+
+    const found = Object.values(desvios).filter(d => {
+      const dv = (d.dataDesvio || '') + (d.criadoEm || '');
+      return dv.includes(isoDate) || dv.includes(brDate) || dv.includes(brDate2);
+    });
+
+    if (found.length === 0) {
+      await bot.sendMessage(MY_CHAT_ID, `📭 Nenhum desvio registrado em *${brDate}*.`, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    const gEmoji = (g) => {
+      const l = (g || '').toLowerCase();
+      if (l.includes('alta') || l.includes('crítica')) return '🔴';
+      if (l.includes('média') || l.includes('media'))  return '🟡';
+      if (l.includes('baixa'))                         return '🟢';
+      return '⚪';
+    };
+    const statusIcon = (s) => s === 'PENDENTE' ? '🔴' : s === 'EM_TRATATIVA' ? '🟡' : '✅';
+
+    let msg = `📅 *Desvios em ${brDate}* — ${found.length} registro(s)\n\n`;
+    found.forEach((d, i) => {
+      msg +=
+        `*${i + 1}. ${d.id}* ${statusIcon(d.status)}\n` +
+        `👤 ${d.motorista}\n` +
+        `⚡ ${d.evento} ${gEmoji(d.gravidade)} ${d.gravidade}\n` +
+        `🕐 ${d.horario} | 🚛 ${d.placa}\n` +
+        `📌 ${d.status}\n\n`;
+    });
+    msg += `_Use /desvio ID para detalhes completos_`;
+
+    await bot.sendMessage(MY_CHAT_ID, msg, { parse_mode: 'Markdown' });
+    return;
+  }
+
   // /pendentes — atalho para pendentes
   if (text === '/pendentes') {
     const pendentes = Object.values(desvios).filter(d => d.status === 'PENDENTE');
