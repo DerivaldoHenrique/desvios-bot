@@ -14,25 +14,71 @@ const GROUP_NAME    = process.env.TELEGRAM_GROUP_NAME || 'OPERAÇÃO QSEMST - ES
 const SENDER_ID     = process.env.TELEGRAM_SENDER_ID ? parseInt(process.env.TELEGRAM_SENDER_ID) : null;
 const BOT_TOKEN     = process.env.DESVIOS_BOT_TOKEN;
 const MY_CHAT_ID    = process.env.TELEGRAM_MY_CHAT_ID;
-const STATE_FILE    = '/tmp/desvios-state.json';
+const STATE_FILE      = '/tmp/desvios-state.json';
+const BACKUP_ID_FILE  = '/tmp/desvios-backup-id.txt';
 
 // ─── Desvios state ────────────────────────────────────────────────────────────
-let desvios = {};           // { [id]: DesvioRecord }
-let pendingAcao = null;     // { desvioId, aguardando: 'confirmacao' }
+let desvios     = {};    // { [id]: DesvioRecord }
+let pendingAcao = null;  // { desvioId, aguardando: 'confirmacao' }
+let backupMsgId = null;  // ID da msg de backup editável no chat do bot
 
-function loadState() {
+function loadLocalState() {
   try {
     const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
     desvios     = raw.desvios     || {};
     pendingAcao = raw.pendingAcao || null;
-    console.log(`[STATE] ${Object.keys(desvios).length} desvios carregados`);
+    console.log(`[STATE] ${Object.keys(desvios).length} desvios carregados do /tmp`);
   } catch (_) {}
+  try { backupMsgId = parseInt(fs.readFileSync(BACKUP_ID_FILE, 'utf8').trim()); } catch (_) {}
 }
 
-function saveState() {
+function saveLocalState() {
+  try { fs.writeFileSync(STATE_FILE, JSON.stringify({ desvios, pendingAcao })); } catch (_) {}
+}
+
+// Restaura estado lendo o histórico do chat com o bot via userbot (gramjs)
+// Chamado no startup APÓS conectar o cliente MTProto
+async function restoreFromTelegram(client) {
   try {
-    fs.writeFileSync(STATE_FILE, JSON.stringify({ desvios, pendingAcao }));
-  } catch (_) {}
+    const messages = await client.getMessages(parseInt(MY_CHAT_ID), { limit: 50 });
+    for (const m of messages) {
+      const txt = m.message || '';
+      if (txt.includes('[BACKUP ESTADO]')) {
+        const jsonMatch = txt.match(/\{[\s\S]+\}/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          desvios     = parsed.desvios     || {};
+          pendingAcao = parsed.pendingAcao || null;
+          backupMsgId = m.id;
+          fs.writeFileSync(BACKUP_ID_FILE, String(m.id));
+          saveLocalState();
+          console.log(`[BACKUP] Estado restaurado do Telegram: ${Object.keys(desvios).length} desvios`);
+          return true;
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[BACKUP] Erro ao restaurar:', err.message);
+  }
+  return false;
+}
+
+// Salva estado como mensagem editável no chat do bot (sobrevive a qualquer restart)
+async function saveBackup() {
+  saveLocalState();
+  try {
+    const payload = JSON.stringify({ desvios, pendingAcao });
+    const text = `📦 [BACKUP ESTADO]\n${payload}`;
+    if (backupMsgId) {
+      await bot.editMessageText(text, { chat_id: MY_CHAT_ID, message_id: backupMsgId });
+    } else {
+      const sent = await bot.sendMessage(MY_CHAT_ID, text);
+      backupMsgId = sent.message_id;
+      fs.writeFileSync(BACKUP_ID_FILE, String(backupMsgId));
+    }
+  } catch (err) {
+    console.error('[BACKUP] Erro ao salvar:', err.message);
+  }
 }
 
 // ─── Desvios bot (envia msgs ao usuário) ──────────────────────────────────────
@@ -269,7 +315,7 @@ bot.on('message', async (msg) => {
     if (lower === 'sim' || lower === 's') {
       if (d) {
         d.status = 'EM_TRATATIVA';
-        saveState();
+        await saveBackup();
         await bot.sendMessage(MY_CHAT_ID,
           `✅ Desvio \`${id}\` marcado como *EM TRATATIVA*.\n\n` +
           `📧 Em breve: envio automático de e-mail ao supervisor ${d.supervisor}.`,
@@ -277,7 +323,7 @@ bot.on('message', async (msg) => {
         console.log(`[BOT] Desvio ${id} → EM_TRATATIVA`);
       }
       pendingAcao = null;
-      saveState();
+      await saveBackup();
       return;
     }
 
@@ -286,9 +332,20 @@ bot.on('message', async (msg) => {
         `⏭ Desvio \`${id}\` mantido como *PENDENTE*. Use /desvio ${id} para retomar.`,
         { parse_mode: 'Markdown' });
       pendingAcao = null;
-      saveState();
+      await saveBackup();
       return;
     }
+  }
+
+  // /sincronizar [dias] — busca PDFs antigos do grupo
+  const sincMatch = text.match(/^\/sincronizar(?:\s+(\d+))?$/i);
+  if (sincMatch) {
+    const dias = parseInt(sincMatch[1] || '7');
+    await bot.sendMessage(MY_CHAT_ID, `🔄 Buscando PDFs dos últimos *${dias} dias* no grupo...`, { parse_mode: 'Markdown' });
+    sincronizarGrupo(dias).catch(err =>
+      bot.sendMessage(MY_CHAT_ID, `❌ Erro na sincronização: ${err.message}`)
+    );
+    return;
   }
 
   // Help
@@ -296,9 +353,66 @@ bot.on('message', async (msg) => {
     `Comandos:\n` +
     `/desvios — lista todos os desvios\n` +
     `/desvio DI-0001 — detalhes do desvio\n` +
-    `/pendentes — desvios aguardando tratativa\n\n` +
-    `Quando um novo relatório chegar, responda *sim* ou *não* para iniciar a tratativa.`);
+    `/pendentes — aguardando tratativa\n` +
+    `/sincronizar 7 — reprocessa PDFs dos últimos N dias\n\n` +
+    `DD/MM/AAAA — desvios de uma data específica\n\n` +
+    `Quando um novo relatório chegar, responda *sim* ou *não*.`);
 });
+
+// ─── Referências globais ao userbot ──────────────────────────────────────────
+let userbotClient  = null;
+let userbotGroupId = null;
+
+// ─── Sincronização retroativa ─────────────────────────────────────────────────
+async function sincronizarGrupo(dias = 7) {
+  if (!userbotClient || !userbotGroupId) {
+    await bot.sendMessage(MY_CHAT_ID, '❌ Userbot não conectado. Verifique as variáveis TELEGRAM_API_ID/HASH/SESSION.');
+    return;
+  }
+
+  const limitDate = new Date();
+  limitDate.setDate(limitDate.getDate() - dias);
+  const limitTs = Math.floor(limitDate.getTime() / 1000);
+
+  let novos = 0, ignorados = 0;
+  const messages = await userbotClient.getMessages(userbotGroupId, { limit: 200 });
+
+  for (const m of messages) {
+    if (m.date < limitTs) continue;
+    if (!m.media?.document) continue;
+
+    // Filtra remetente
+    if (SENDER_ID && Number(m.senderId) !== SENDER_ID) continue;
+
+    const doc      = m.media.document;
+    const mimeType = doc.mimeType || '';
+    const fileName = doc.attributes?.find(a => a.fileName)?.fileName || '';
+    const isPdf    = mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
+    if (!isPdf) continue;
+
+    try {
+      const buffer = await userbotClient.downloadMedia(m, { outputFile: Buffer });
+      if (!buffer || buffer.length === 0) continue;
+
+      const desvio = await parsePdf(buffer);
+
+      if (desvios[desvio.id]) { ignorados++; continue; } // já processado
+
+      desvios[desvio.id] = desvio;
+      novos++;
+      console.log(`[SINC] Novo desvio importado: ${desvio.id}`);
+    } catch (err) {
+      console.error(`[SINC] Erro ao processar msg ${m.id}:`, err.message);
+    }
+  }
+
+  await saveBackup();
+  await bot.sendMessage(MY_CHAT_ID,
+    `✅ *Sincronização concluída!*\n` +
+    `📥 ${novos} novo(s) | ⏭ ${ignorados} já existia(m)\n\n` +
+    `Use /desvios para ver a lista completa.`,
+    { parse_mode: 'Markdown' });
+}
 
 // ─── Userbot (monitora o grupo) ───────────────────────────────────────────────
 async function startUserbot() {
@@ -378,7 +492,7 @@ async function startUserbot() {
 
       // Guarda o desvio
       desvios[desvio.id] = desvio;
-      saveState();
+      await saveBackup();
 
       // Notifica
       await notificarDesvio(desvio);
@@ -389,17 +503,29 @@ async function startUserbot() {
   }, new NewMessage({}));
 
   console.log(`[USERBOT] Monitorando grupo "${GROUP_NAME}"...`);
+
+  // Expõe função de sincronização retroativa
+  userbotClient = client;
+  userbotGroupId = targetGroupId;
 }
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
 (async () => {
   console.log('[BOT] Iniciando Desvios Bot...');
-  loadState();
+  loadLocalState(); // carrega /tmp (rápido, pode estar vazio após restart)
 
   try {
-    await startUserbot();
+    await startUserbot(); // conecta userbot e expõe userbotClient
   } catch (err) {
     console.error('[USERBOT] Falha ao iniciar:', err.message);
+  }
+
+  // Tenta restaurar estado do histórico do Telegram (sobrevive a restarts)
+  if (userbotClient && Object.keys(desvios).length === 0) {
+    const restored = await restoreFromTelegram(userbotClient);
+    if (!restored) {
+      console.log('[BACKUP] Sem backup encontrado, iniciando do zero.');
+    }
   }
 
   try {
@@ -408,7 +534,8 @@ async function startUserbot() {
       `📋 ${Object.keys(desvios).length} desvios carregados\n\n` +
       `Monitorando: _${GROUP_NAME}_\n\n` +
       `/desvios — lista completa\n` +
-      `/pendentes — aguardando tratativa`,
+      `/pendentes — aguardando tratativa\n` +
+      `/sincronizar 7 — importar PDFs antigos`,
       { parse_mode: 'Markdown' });
     console.log('[BOT] Pronto.');
   } catch (err) {
