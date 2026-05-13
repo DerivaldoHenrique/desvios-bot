@@ -83,7 +83,8 @@ async function saveBackup() {
 }
 
 // ─── Desvios bot (envia msgs ao usuário) ──────────────────────────────────────
-const bot = new TelegramBot(BOT_TOKEN, { polling: true });
+// polling inicia manualmente após delay para evitar 409 no Railway
+const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
 // ─── OCR (imagens) ────────────────────────────────────────────────────────────
 async function ocrImage(buffer) {
@@ -411,13 +412,14 @@ async function sincronizarGrupo(dias = 7) {
   limitDate.setDate(limitDate.getDate() - dias);
   const limitTs = Math.floor(limitDate.getTime() / 1000);
 
-  let novos = 0, ignorados = 0;
-  const messages = await userbotClient.getMessages(userbotGroupId, { limit: 200 });
+  let novos = 0, ignorados = 0, erros = 0;
+  const messages = await userbotClient.getMessages(userbotGroupId, { limit: 300 });
+  console.log(`[SINC] Total de mensagens no grupo: ${messages.length}`);
 
   for (const m of messages) {
     if (m.date < limitTs) continue;
 
-    // Filtra remetente
+    // Filtra remetente (log para debug)
     if (SENDER_ID && Number(m.senderId) !== SENDER_ID) continue;
 
     const media    = m.media;
@@ -427,17 +429,22 @@ async function sincronizarGrupo(dias = 7) {
 
     let mimeType = 'image/jpeg';
     if (hasDoc) {
-      const doc = media.document;
-      mimeType  = doc.mimeType || '';
-      const fileName = doc.attributes?.find(a => a.fileName)?.fileName || '';
+      const doc  = media.document;
+      mimeType   = doc.mimeType || '';
+      const fn   = doc.attributes?.find(a => a.fileName)?.fileName || '';
       const isImg = mimeType.startsWith('image/');
-      const isPdf = mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
-      if (!isImg && !isPdf) continue;
+      const isPdf = mimeType === 'application/pdf' || fn.toLowerCase().endsWith('.pdf');
+      if (!isImg && !isPdf) {
+        console.log(`[SINC] Ignorando doc tipo: ${mimeType} "${fn}"`);
+        continue;
+      }
     }
+
+    console.log(`[SINC] Processando msg ${m.id} tipo=${mimeType} foto=${hasPhoto} sender=${m.senderId}`);
 
     try {
       const buffer = await userbotClient.downloadMedia(m, { outputFile: Buffer });
-      if (!buffer || buffer.length === 0) continue;
+      if (!buffer || buffer.length === 0) { console.log(`[SINC] Buffer vazio msg ${m.id}`); continue; }
 
       const desvio = await parseDocument(buffer, mimeType);
 
@@ -445,18 +452,27 @@ async function sincronizarGrupo(dias = 7) {
 
       desvios[desvio.id] = desvio;
       novos++;
-      console.log(`[SINC] Novo desvio importado: ${desvio.id}`);
+      console.log(`[SINC] Novo desvio importado: ${desvio.id} — ${desvio.motorista}`);
     } catch (err) {
-      if (err.message === 'NÃO_RELATORIO') continue; // imagem ignorada silenciosamente
-      console.error(`[SINC] Erro ao processar msg ${m.id}:`, err.message);
+      if (err.message === 'NÃO_RELATORIO') { console.log(`[SINC] Msg ${m.id}: não é relatório de desvio`); continue; }
+      console.error(`[SINC] Erro msg ${m.id}:`, err.message);
+      erros++;
     }
   }
+
+  // Log de senders encontrados no período (ajuda a confirmar o SENDER_ID certo)
+  const sendersNoGrupo = [...new Set(
+    messages
+      .filter(m => m.date >= limitTs && (m.media?.photo || m.media?.document))
+      .map(m => String(m.senderId))
+  )];
+  console.log(`[SINC] Senders com mídia no período: ${sendersNoGrupo.join(', ') || 'nenhum'}`);
 
   await saveBackup();
   await bot.sendMessage(MY_CHAT_ID,
     `✅ *Sincronização concluída!*\n` +
-    `📥 ${novos} novo(s) | ⏭ ${ignorados} já existia(m)\n\n` +
-    `Use /desvios para ver a lista completa.`,
+    `📥 ${novos} novo(s) | ⏭ ${ignorados} já existia(m) | ❌ ${erros} erro(s)\n\n` +
+    (novos > 0 ? `Use /desvios para ver a lista completa.` : `Nenhum relatório de desvio encontrado.\nVerifique o log do Railway para detalhes.`),
     { parse_mode: 'Markdown' });
 }
 
@@ -586,6 +602,13 @@ async function startUserbot() {
       console.log('[BACKUP] Sem backup encontrado, iniciando do zero.');
     }
   }
+
+  // Aguarda 8s antes de iniciar polling — evita 409 Conflict no Railway
+  // (instância anterior precisa de tempo para encerrar)
+  console.log('[BOT] Aguardando 8s antes de iniciar polling...');
+  await new Promise(r => setTimeout(r, 8000));
+  bot.startPolling({ restart: false });
+  console.log('[BOT] Polling iniciado.');
 
   try {
     await bot.sendMessage(MY_CHAT_ID,
