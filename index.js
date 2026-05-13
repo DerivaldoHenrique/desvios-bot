@@ -4,6 +4,7 @@ const { StringSession }  = require('telegram/sessions');
 const { NewMessage }     = require('telegram/events');
 const TelegramBot        = require('node-telegram-bot-api');
 const pdfParse           = require('pdf-parse');
+const Tesseract          = require('tesseract.js');
 const fs                 = require('fs');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -84,6 +85,22 @@ async function saveBackup() {
 // ─── Desvios bot (envia msgs ao usuário) ──────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
 
+// ─── OCR (imagens) ────────────────────────────────────────────────────────────
+async function ocrImage(buffer) {
+  const { data: { text } } = await Tesseract.recognize(buffer, 'por', {
+    logger: () => {},
+  });
+  return text;
+}
+
+// ─── Detecta se o texto parece um relatório de desvio ─────────────────────────
+function isRelatorioDesvio(text) {
+  const keywords = ['DIÁRIO DE BORDO', 'DESVIO', 'MOTORISTA', 'GRAVIDADE', 'EVENTO', 'ANÁLISE', 'DI-'];
+  const upper = text.toUpperCase();
+  const matches = keywords.filter(k => upper.includes(k)).length;
+  return matches >= 3; // precisa ter pelo menos 3 palavras-chave
+}
+
 // ─── PDF Parser ───────────────────────────────────────────────────────────────
 function extractField(text, label) {
   // Tenta capturar o valor após o rótulo, até a próxima linha não-vazia
@@ -97,10 +114,7 @@ function parseDesvioId(text) {
   return m ? m[1] : `DI-${Date.now().toString().slice(-6)}`;
 }
 
-async function parsePdf(buffer) {
-  const data = await pdfParse(buffer);
-  const text = data.text;
-
+function parseDesvioFromText(text) {
   const get = (label) => extractField(text, label);
 
   // Extrai campos principais
@@ -142,6 +156,29 @@ async function parsePdf(buffer) {
     criadoEm:    new Date().toISOString(),
     rawText:     text,
   };
+}
+
+// ─── Roteador: PDF ou imagem ──────────────────────────────────────────────────
+async function parseDocument(buffer, mimeType) {
+  const isPdf = mimeType === 'application/pdf';
+  const isImg = mimeType?.startsWith('image/') || !mimeType;
+
+  let text;
+  if (isPdf) {
+    const data = await pdfParse(buffer);
+    text = data.text;
+  } else if (isImg) {
+    text = await ocrImage(buffer);
+    console.log('[OCR] Texto extraído (primeiros 300 chars):', text.slice(0, 300));
+  } else {
+    throw new Error(`Tipo não suportado: ${mimeType}`);
+  }
+
+  if (!isRelatorioDesvio(text)) {
+    throw new Error('NÃO_RELATORIO'); // sinal para ignorar sem erro
+  }
+
+  return parseDesvioFromText(text);
 }
 
 // ─── Gravidade emoji ──────────────────────────────────────────────────────────
@@ -379,29 +416,38 @@ async function sincronizarGrupo(dias = 7) {
 
   for (const m of messages) {
     if (m.date < limitTs) continue;
-    if (!m.media?.document) continue;
 
     // Filtra remetente
     if (SENDER_ID && Number(m.senderId) !== SENDER_ID) continue;
 
-    const doc      = m.media.document;
-    const mimeType = doc.mimeType || '';
-    const fileName = doc.attributes?.find(a => a.fileName)?.fileName || '';
-    const isPdf    = mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
-    if (!isPdf) continue;
+    const media    = m.media;
+    const hasDoc   = !!media?.document;
+    const hasPhoto = !!media?.photo;
+    if (!hasDoc && !hasPhoto) continue;
+
+    let mimeType = 'image/jpeg';
+    if (hasDoc) {
+      const doc = media.document;
+      mimeType  = doc.mimeType || '';
+      const fileName = doc.attributes?.find(a => a.fileName)?.fileName || '';
+      const isImg = mimeType.startsWith('image/');
+      const isPdf = mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
+      if (!isImg && !isPdf) continue;
+    }
 
     try {
       const buffer = await userbotClient.downloadMedia(m, { outputFile: Buffer });
       if (!buffer || buffer.length === 0) continue;
 
-      const desvio = await parsePdf(buffer);
+      const desvio = await parseDocument(buffer, mimeType);
 
-      if (desvios[desvio.id]) { ignorados++; continue; } // já processado
+      if (desvios[desvio.id]) { ignorados++; continue; }
 
       desvios[desvio.id] = desvio;
       novos++;
       console.log(`[SINC] Novo desvio importado: ${desvio.id}`);
     } catch (err) {
+      if (err.message === 'NÃO_RELATORIO') continue; // imagem ignorada silenciosamente
       console.error(`[SINC] Erro ao processar msg ${m.id}:`, err.message);
     }
   }
@@ -459,34 +505,47 @@ async function startUserbot() {
       // Filtra pelo remetente (se configurado)
       if (SENDER_ID && Number(message.senderId) !== SENDER_ID) return;
 
-      // Verifica se tem documento (PDF)
+      // Verifica se tem mídia (documento ou foto)
       const media = message.media;
-      if (!media || !media.document) return;
+      if (!media) return;
 
-      const doc      = media.document;
-      const mimeType = doc.mimeType || '';
-      const fileName = doc.attributes?.find(a => a.fileName)?.fileName || '';
+      const hasDoc   = !!media.document;
+      const hasPhoto = !!media.photo;
+      if (!hasDoc && !hasPhoto) return;
 
-      const isPdf = mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
-      if (!isPdf) return;
+      let mimeType = 'image/jpeg';
+      let fileName = 'imagem';
+      if (hasDoc) {
+        const doc = media.document;
+        mimeType  = doc.mimeType || '';
+        fileName  = doc.attributes?.find(a => a.fileName)?.fileName || 'arquivo';
+        // Ignora arquivos que claramente não são relevantes (ex: vídeos)
+        const isImg = mimeType.startsWith('image/');
+        const isPdf = mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
+        if (!isImg && !isPdf) return;
+      }
 
-      console.log(`[USERBOT] PDF recebido: "${fileName}" de sender ${message.senderId}`);
+      console.log(`[USERBOT] Mídia recebida: "${fileName}" (${mimeType}) de sender ${message.senderId}`);
 
-      // Download do PDF
+      // Download
       const buffer = await client.downloadMedia(message, { outputFile: Buffer });
       if (!buffer || buffer.length === 0) {
-        console.error('[USERBOT] Buffer vazio ao baixar PDF');
+        console.error('[USERBOT] Buffer vazio ao baixar mídia');
         return;
       }
 
-      // Parse
+      // Parse (PDF ou OCR de imagem)
       let desvio;
       try {
-        desvio = await parsePdf(buffer);
+        desvio = await parseDocument(buffer, mimeType);
       } catch (err) {
-        console.error('[USERBOT] Erro ao parsear PDF:', err.message);
+        if (err.message === 'NÃO_RELATORIO') {
+          console.log('[USERBOT] Imagem ignorada: não é relatório de desvio');
+          return;
+        }
+        console.error('[USERBOT] Erro ao parsear mídia:', err.message);
         await bot.sendMessage(MY_CHAT_ID,
-          `⚠️ Recebi um PDF do grupo mas não consegui extrair os dados.\nArquivo: ${fileName}\nErro: ${err.message}`);
+          `⚠️ Recebi uma imagem do grupo mas não consegui extrair os dados.\nArquivo: ${fileName}\nErro: ${err.message}`);
         return;
       }
 

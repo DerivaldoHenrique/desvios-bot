@@ -11,6 +11,7 @@
     "telegram": "^2.26.0",
     "node-telegram-bot-api": "^0.66.0",
     "pdf-parse": "^1.1.1",
+    "tesseract.js": "^5.1.1",
     "dotenv": "^16.4.7",
     "axios": "^1.7.9"
   },
