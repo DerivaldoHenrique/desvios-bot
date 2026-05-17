@@ -19,20 +19,23 @@ const MY_CHAT_ID    = process.env.TELEGRAM_MY_CHAT_ID;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
 // ─── State (em memória, fonte da verdade = PostgreSQL) ────────────────────────
-let desvios     = {};   // { [id]: DesvioRecord }
-let pendingAcao = null; // { desvioId, aguardando: 'confirmacao' }
+// Chave = telegramMsgId (string) — único por mensagem, sem colisões de ID DI-XXXX
+let desvios     = {};   // { [telegramMsgId]: DesvioRecord }
+let pendingAcao = null; // { desvioKey: telegramMsgId, aguardando: 'confirmacao' }
 
 async function reloadDesvios() {
   const rows = await db.loadAllDesvios();
   desvios = {};
-  for (const d of rows) desvios[d.id] = d;
+  for (const d of rows) desvios[d.telegramMsgId] = d;
   console.log(`[DB] ${rows.length} desvios carregados`);
 }
 
-async function persistirDesvio(desvio, telegramMsgId = null) {
-  desvios[desvio.id] = desvio;
+async function persistirDesvio(desvio, telegramMsgId) {
+  if (!telegramMsgId) throw new Error('persistirDesvio: telegramMsgId obrigatório');
+  const key = String(telegramMsgId);
+  desvios[key] = { ...desvio, telegramMsgId: key };
   await db.saveDesvio(desvio, telegramMsgId);
-  if (telegramMsgId) await db.markMsgProcessed(telegramMsgId, true, desvio.id);
+  await db.markMsgProcessed(telegramMsgId, true, desvio.id);
 }
 
 // ─── Bot ──────────────────────────────────────────────────────────────────────
@@ -284,7 +287,7 @@ function formatResumo(d, completo = false) {
 
 // ─── Notifica novo desvio ─────────────────────────────────────────────────────
 async function notificarDesvio(desvio) {
-  pendingAcao = { desvioId: desvio.id, aguardando: 'confirmacao' };
+  pendingAcao = { desvioKey: desvio.telegramMsgId, aguardando: 'confirmacao' };
   await bot.sendMessage(MY_CHAT_ID, formatResumo(desvio), { parse_mode: 'Markdown' });
   console.log(`[BOT] Desvio ${desvio.id} notificado — ${desvio.motorista}`);
 }
@@ -336,9 +339,17 @@ bot.on('message', async (msg) => {
   const desvioCmd = text.match(/^\/desvio\s+([A-Z]{2}-[\dA-Z]+)/i);
   if (desvioCmd) {
     const id = desvioCmd[1].toUpperCase();
-    const d  = desvios[id];
-    if (!d) { await bot.sendMessage(MY_CHAT_ID, `❌ \`${id}\` não encontrado.`, { parse_mode: 'Markdown' }); return; }
-    await bot.sendMessage(MY_CHAT_ID, formatResumo(d, true), { parse_mode: 'Markdown' });
+    // Busca por id (pode haver múltiplos com mesmo DI-XXXX em datas diferentes)
+    const matches = Object.values(desvios)
+      .filter(d => (d.id || '').toUpperCase() === id)
+      .sort((a, b) => (b.dataDesvio || '').localeCompare(a.dataDesvio || ''));
+    if (matches.length === 0) {
+      await bot.sendMessage(MY_CHAT_ID, `❌ \`${id}\` não encontrado.`, { parse_mode: 'Markdown' });
+      return;
+    }
+    for (const d of matches) {
+      await bot.sendMessage(MY_CHAT_ID, formatResumo(d, true), { parse_mode: 'Markdown' });
+    }
     return;
   }
 
@@ -383,34 +394,56 @@ bot.on('message', async (msg) => {
     return;
   }
 
-  // ── /sincronizar [dias] ─────────────────────────────────────────────────────
-  const sincMatch = text.match(/^\/sincronizar(?:\s+(\d+))?$/i);
+  // ── /sincronizar [dias] [force] ────────────────────────────────────────────
+  const sincMatch = text.match(/^\/sincronizar(?:\s+(\d+))?(?:\s+(force))?$/i);
   if (sincMatch) {
-    const dias = parseInt(sincMatch[1] || '7');
-    await bot.sendMessage(MY_CHAT_ID, `🔄 Buscando relatórios dos últimos *${dias} dias*...`, { parse_mode: 'Markdown' });
-    sincronizarGrupo(dias).catch(err => bot.sendMessage(MY_CHAT_ID, `❌ Erro: ${err.message}`));
+    const dias  = parseInt(sincMatch[1] || '7');
+    const force = !!(sincMatch[2]);
+    await bot.sendMessage(MY_CHAT_ID,
+      `🔄 Buscando relatórios dos últimos *${dias} dias*${force ? ' (force)' : ''}...`,
+      { parse_mode: 'Markdown' });
+    sincronizarGrupo(dias, force).catch(err => bot.sendMessage(MY_CHAT_ID, `❌ Erro: ${err.message}`));
+    return;
+  }
+
+  // ── /resincronizar [dias] — limpa tudo e reimporta ──────────────────────────
+  const resincMatch = text.match(/^\/resincronizar(?:\s+(\d+))?$/i);
+  if (resincMatch) {
+    const dias = parseInt(resincMatch[1] || '30');
+    await bot.sendMessage(MY_CHAT_ID,
+      `🗑 Limpando dados antigos e reimportando últimos *${dias} dias*...`,
+      { parse_mode: 'Markdown' });
+    try {
+      await db.clearAllDesvios();
+      await db.clearProcessedMessages();
+      desvios = {};
+      await sincronizarGrupo(dias, true);
+    } catch (err) {
+      await bot.sendMessage(MY_CHAT_ID, `❌ Erro: ${err.message}`);
+    }
     return;
   }
 
   // ── Confirmação de tratativa ────────────────────────────────────────────────
   if (pendingAcao?.aguardando === 'confirmacao') {
     const lower = text.toLowerCase();
-    const id    = pendingAcao.desvioId;
-    const d     = desvios[id];
+    const key   = pendingAcao.desvioKey;
+    const d     = desvios[key];
+    const label = d ? d.id : key;
 
     if (lower === 'sim' || lower === 's') {
       if (d) {
         d.status = 'EM_TRATATIVA';
-        await db.updateDesvioStatus(id, 'EM_TRATATIVA');
+        await db.updateDesvioStatus(key, 'EM_TRATATIVA');
       }
       await bot.sendMessage(MY_CHAT_ID,
-        `✅ Desvio \`${id}\` → *EM TRATATIVA*\n📧 Em breve: envio automático de e-mail.`,
+        `✅ Desvio \`${label}\` → *EM TRATATIVA*\n📧 Em breve: envio automático de e-mail.`,
         { parse_mode: 'Markdown' });
       pendingAcao = null;
       return;
     }
     if (lower === 'não' || lower === 'nao' || lower === 'n') {
-      await bot.sendMessage(MY_CHAT_ID, `⏭ \`${id}\` mantido como PENDENTE.`, { parse_mode: 'Markdown' });
+      await bot.sendMessage(MY_CHAT_ID, `⏭ \`${label}\` mantido como PENDENTE.`, { parse_mode: 'Markdown' });
       pendingAcao = null;
       return;
     }
@@ -421,9 +454,11 @@ bot.on('message', async (msg) => {
     `*Desvios Bot*\n\n` +
     `Comandos:\n` +
     `/desvios — lista completa\n` +
-    `/desvio DI-0001 — detalhes\n` +
+    `/desvio DI-0001 — detalhes (todas as ocorrências)\n` +
     `/pendentes — aguardando tratativa\n` +
-    `/sincronizar 7 — importar últimos N dias\n\n` +
+    `/sincronizar 7 — importar últimos N dias\n` +
+    `/sincronizar 7 force — reimporta mesmo já vistos\n` +
+    `/resincronizar 30 — limpa tudo e reimporta do zero\n\n` +
     `DD/MM/AAAA — desvios de uma data\n\n` +
     `Quando um relatório chegar, responda *sim* ou *não*.`,
     { parse_mode: 'Markdown' });
@@ -434,7 +469,7 @@ let userbotClient  = null;
 let userbotGroupId = null;
 
 // ─── Sincronização retroativa ─────────────────────────────────────────────────
-async function sincronizarGrupo(dias = 7) {
+async function sincronizarGrupo(dias = 7, force = false) {
   if (!userbotClient || !userbotGroupId) {
     await bot.sendMessage(MY_CHAT_ID, '❌ Userbot não conectado.');
     return;
@@ -453,8 +488,8 @@ async function sincronizarGrupo(dias = 7) {
   console.log(`[SINC] ${candidatos.length} mensagens com mídia do sender no período`);
 
   for (const m of candidatos) {
-    // ── SKIP se já processado (economiza download + Claude) ──────────────────
-    if (await db.isMsgProcessed(m.id)) { jaVisto++; continue; }
+    // ── SKIP se já processado — a menos que force=true ───────────────────────
+    if (!force && await db.isMsgProcessed(m.id)) { jaVisto++; continue; }
 
     const doc    = m.media?.document;
     let mimeType = 'image/jpeg';

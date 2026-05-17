@@ -7,7 +7,6 @@ if (!connStr) {
   process.exit(1);
 }
 
-// SSL necessário para conexão externa (proxy público), desnecessário na rede interna
 const useSSL = !connStr.includes('railway.internal');
 
 const pool = new Pool({
@@ -18,6 +17,7 @@ const pool = new Pool({
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
 async function setupDb() {
+  // Cria tabelas se não existirem (setup novo — PK já é telegram_msg_id)
   await pool.query(`
     CREATE TABLE IF NOT EXISTS processed_messages (
       telegram_msg_id BIGINT PRIMARY KEY,
@@ -27,8 +27,8 @@ async function setupDb() {
     );
 
     CREATE TABLE IF NOT EXISTS desvios (
-      id                  VARCHAR(30) PRIMARY KEY,
-      telegram_msg_id     BIGINT,
+      telegram_msg_id     BIGINT PRIMARY KEY,
+      id                  VARCHAR(30),
       evento              VARCHAR(200),
       placa               VARCHAR(30),
       motorista           VARCHAR(200),
@@ -54,12 +54,45 @@ async function setupDb() {
       atualizado_em       TIMESTAMPTZ DEFAULT NOW()
     );
   `);
+
+  // Migração: se tabela antiga ainda tem id como PK, converte para telegram_msg_id
+  await pool.query(`
+    DO $$
+    DECLARE
+      pk_col TEXT;
+    BEGIN
+      SELECT kcu.column_name INTO pk_col
+      FROM information_schema.table_constraints tc
+      JOIN information_schema.key_column_usage kcu
+        ON tc.constraint_name = kcu.constraint_name
+        AND tc.table_schema   = kcu.table_schema
+        AND tc.table_name     = kcu.table_name
+      WHERE tc.table_schema = 'public'
+        AND tc.table_name   = 'desvios'
+        AND tc.constraint_type = 'PRIMARY KEY'
+      LIMIT 1;
+
+      IF pk_col = 'id' THEN
+        RAISE NOTICE '[DB] Migrando PK de id para telegram_msg_id...';
+        ALTER TABLE desvios DROP CONSTRAINT desvios_pkey;
+        UPDATE desvios
+        SET telegram_msg_id = (
+          EXTRACT(EPOCH FROM COALESCE(criado_em, NOW()))::bigint * 1000
+          + (random() * 999)::int
+        )
+        WHERE telegram_msg_id IS NULL;
+        ALTER TABLE desvios ALTER COLUMN telegram_msg_id SET NOT NULL;
+        ALTER TABLE desvios ADD CONSTRAINT desvios_pkey PRIMARY KEY (telegram_msg_id);
+        RAISE NOTICE '[DB] Migracao concluida.';
+      END IF;
+    END $$;
+  `);
+
   console.log('[DB] Tabelas OK');
 }
 
 // ─── Processed messages ───────────────────────────────────────────────────────
 
-// Verifica se mensagem já foi processada
 async function isMsgProcessed(telegramMsgId) {
   const r = await pool.query(
     'SELECT telegram_msg_id FROM processed_messages WHERE telegram_msg_id = $1',
@@ -68,7 +101,6 @@ async function isMsgProcessed(telegramMsgId) {
   return r.rowCount > 0;
 }
 
-// Marca mensagem como processada
 async function markMsgProcessed(telegramMsgId, isDesvio, desvioId = null) {
   await pool.query(
     `INSERT INTO processed_messages (telegram_msg_id, is_desvio, desvio_id)
@@ -78,26 +110,37 @@ async function markMsgProcessed(telegramMsgId, isDesvio, desvioId = null) {
   );
 }
 
+async function clearProcessedMessages() {
+  await pool.query('DELETE FROM processed_messages');
+}
+
 // ─── Desvios ──────────────────────────────────────────────────────────────────
 
-async function saveDesvio(d, telegramMsgId = null) {
+// telegramMsgId é a PK — obrigatório
+async function saveDesvio(d, telegramMsgId) {
+  if (!telegramMsgId) throw new Error('saveDesvio: telegramMsgId obrigatório');
+
   await pool.query(
     `INSERT INTO desvios (
-      id, telegram_msg_id, evento, placa, motorista, data_desvio, horario, turno,
+      telegram_msg_id, id, evento, placa, motorista, data_desvio, horario, turno,
       reincidente, primeira_ocorrencia, unidade, supervisor, descumpriu_cartilha,
       evidencia_tratativa, gravidade, observacao, descricao, analise,
       contato_realizado, respondente, autor, data_resposta, status, atualizado_em
     ) VALUES (
       $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW()
     )
-    ON CONFLICT (id) DO UPDATE SET
-      evento = EXCLUDED.evento, placa = EXCLUDED.placa, motorista = EXCLUDED.motorista,
-      data_desvio = EXCLUDED.data_desvio, horario = EXCLUDED.horario, turno = EXCLUDED.turno,
-      reincidente = EXCLUDED.reincidente, unidade = EXCLUDED.unidade, supervisor = EXCLUDED.supervisor,
-      gravidade = EXCLUDED.gravidade, descricao = EXCLUDED.descricao, analise = EXCLUDED.analise,
-      respondente = EXCLUDED.respondente, status = EXCLUDED.status, atualizado_em = NOW()`,
+    ON CONFLICT (telegram_msg_id) DO UPDATE SET
+      id = EXCLUDED.id, evento = EXCLUDED.evento, placa = EXCLUDED.placa,
+      motorista = EXCLUDED.motorista, data_desvio = EXCLUDED.data_desvio,
+      horario = EXCLUDED.horario, turno = EXCLUDED.turno,
+      reincidente = EXCLUDED.reincidente, unidade = EXCLUDED.unidade,
+      supervisor = EXCLUDED.supervisor, gravidade = EXCLUDED.gravidade,
+      descricao = EXCLUDED.descricao, analise = EXCLUDED.analise,
+      respondente = EXCLUDED.respondente, status = EXCLUDED.status,
+      atualizado_em = NOW()`,
     [
-      d.id, telegramMsgId, d.evento, d.placa, d.motorista, d.dataDesvio, d.horario, d.turno,
+      telegramMsgId,
+      d.id, d.evento, d.placa, d.motorista, d.dataDesvio, d.horario, d.turno,
       d.reincidente, d.primeiraOcorrencia, d.unidade, d.supervisor, d.descumpriuCartilha,
       d.evidenciaTratativa, d.gravidade, d.observacao, d.descricao, d.analise,
       d.contatoRealizado, d.respondente, d.autor, d.dataResposta, d.status,
@@ -105,39 +148,43 @@ async function saveDesvio(d, telegramMsgId = null) {
   );
 }
 
-async function updateDesvioStatus(id, status) {
+async function updateDesvioStatus(telegramMsgId, status) {
   await pool.query(
-    'UPDATE desvios SET status = $1, atualizado_em = NOW() WHERE id = $2',
-    [status, id]
+    'UPDATE desvios SET status = $1, atualizado_em = NOW() WHERE telegram_msg_id = $2',
+    [status, telegramMsgId]
   );
+}
+
+async function clearAllDesvios() {
+  await pool.query('DELETE FROM desvios');
 }
 
 async function loadAllDesvios() {
   const r = await pool.query('SELECT * FROM desvios ORDER BY criado_em DESC');
-  // Converte snake_case → camelCase para compatibilidade com o resto do código
   return r.rows.map(row => ({
-    id:                 row.id,
-    evento:             row.evento             || '—',
-    placa:              row.placa              || '—',
-    motorista:          row.motorista          || '—',
-    dataDesvio:         row.data_desvio        || '—',
-    horario:            row.horario            || '—',
-    turno:              row.turno              || '—',
-    reincidente:        row.reincidente        || '—',
-    primeiraOcorrencia: row.primeira_ocorrencia|| '—',
-    unidade:            row.unidade            || '—',
-    supervisor:         row.supervisor         || '—',
-    descumpriuCartilha: row.descumpriu_cartilha|| '—',
-    evidenciaTratativa: row.evidencia_tratativa|| '—',
-    gravidade:          row.gravidade          || '—',
-    observacao:         row.observacao         || '—',
-    descricao:          row.descricao          || '—',
-    analise:            row.analise            || '—',
-    contatoRealizado:   row.contato_realizado  || '—',
-    respondente:        row.respondente        || '—',
-    autor:              row.autor              || '—',
-    dataResposta:       row.data_resposta      || '—',
-    status:             row.status             || 'PENDENTE',
+    telegramMsgId:      String(row.telegram_msg_id),
+    id:                 row.id                  || '—',
+    evento:             row.evento              || '—',
+    placa:              row.placa               || '—',
+    motorista:          row.motorista           || '—',
+    dataDesvio:         row.data_desvio         || '—',
+    horario:            row.horario             || '—',
+    turno:              row.turno               || '—',
+    reincidente:        row.reincidente         || '—',
+    primeiraOcorrencia: row.primeira_ocorrencia || '—',
+    unidade:            row.unidade             || '—',
+    supervisor:         row.supervisor          || '—',
+    descumpriuCartilha: row.descumpriu_cartilha || '—',
+    evidenciaTratativa: row.evidencia_tratativa || '—',
+    gravidade:          row.gravidade           || '—',
+    observacao:         row.observacao          || '—',
+    descricao:          row.descricao           || '—',
+    analise:            row.analise             || '—',
+    contatoRealizado:   row.contato_realizado   || '—',
+    respondente:        row.respondente         || '—',
+    autor:              row.autor               || '—',
+    dataResposta:       row.data_resposta       || '—',
+    status:             row.status              || 'PENDENTE',
     criadoEm:           row.criado_em?.toISOString() || new Date().toISOString(),
   }));
 }
@@ -146,7 +193,9 @@ module.exports = {
   setupDb,
   isMsgProcessed,
   markMsgProcessed,
+  clearProcessedMessages,
   saveDesvio,
   updateDesvioStatus,
+  clearAllDesvios,
   loadAllDesvios,
 };
