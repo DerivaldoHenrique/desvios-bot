@@ -3,8 +3,8 @@ const { TelegramClient } = require('telegram');
 const { StringSession }  = require('telegram/sessions');
 const { NewMessage }     = require('telegram/events');
 const TelegramBot        = require('node-telegram-bot-api');
+const Anthropic          = require('@anthropic-ai/sdk');
 const pdfParse           = require('pdf-parse');
-const Tesseract          = require('tesseract.js');
 const fs                 = require('fs');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -15,13 +15,15 @@ const GROUP_NAME    = process.env.TELEGRAM_GROUP_NAME || 'OPERAÇÃO QSEMST - ES
 const SENDER_ID     = process.env.TELEGRAM_SENDER_ID ? parseInt(process.env.TELEGRAM_SENDER_ID) : null;
 const BOT_TOKEN     = process.env.DESVIOS_BOT_TOKEN;
 const MY_CHAT_ID    = process.env.TELEGRAM_MY_CHAT_ID;
-const STATE_FILE      = '/tmp/desvios-state.json';
-const BACKUP_ID_FILE  = '/tmp/desvios-backup-id.txt';
+const STATE_FILE    = '/tmp/desvios-state.json';
+const BACKUP_ID_FILE = '/tmp/desvios-backup-id.txt';
 
-// ─── Desvios state ────────────────────────────────────────────────────────────
-let desvios     = {};    // { [id]: DesvioRecord }
-let pendingAcao = null;  // { desvioId, aguardando: 'confirmacao' }
-let backupMsgId = null;  // ID da msg de backup editável no chat do bot
+const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+
+// ─── State ────────────────────────────────────────────────────────────────────
+let desvios     = {};
+let pendingAcao = null;
+let backupMsgId = null;
 
 function loadLocalState() {
   try {
@@ -37,11 +39,9 @@ function saveLocalState() {
   try { fs.writeFileSync(STATE_FILE, JSON.stringify({ desvios, pendingAcao })); } catch (_) {}
 }
 
-// Restaura estado lendo o histórico do chat com o bot via userbot (gramjs)
-// Chamado no startup APÓS conectar o cliente MTProto
 async function restoreFromTelegram(client) {
   try {
-    const messages = await client.getMessages(parseInt(MY_CHAT_ID), { limit: 50 });
+    const messages = await client.getMessages(parseInt(MY_CHAT_ID), { limit: 80 });
     for (const m of messages) {
       const txt = m.message || '';
       if (txt.includes('[BACKUP ESTADO]')) {
@@ -53,7 +53,7 @@ async function restoreFromTelegram(client) {
           backupMsgId = m.id;
           fs.writeFileSync(BACKUP_ID_FILE, String(m.id));
           saveLocalState();
-          console.log(`[BACKUP] Estado restaurado do Telegram: ${Object.keys(desvios).length} desvios`);
+          console.log(`[BACKUP] Restaurado: ${Object.keys(desvios).length} desvios`);
           return true;
         }
       }
@@ -64,7 +64,6 @@ async function restoreFromTelegram(client) {
   return false;
 }
 
-// Salva estado como mensagem editável no chat do bot (sobrevive a qualquer restart)
 async function saveBackup() {
   saveLocalState();
   try {
@@ -82,387 +81,338 @@ async function saveBackup() {
   }
 }
 
-// ─── Desvios bot (envia msgs ao usuário) ──────────────────────────────────────
-// polling inicia manualmente após delay para evitar 409 no Railway
+// ─── Bot ──────────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// ─── OCR (imagens) ────────────────────────────────────────────────────────────
-async function ocrImage(buffer) {
-  const { data: { text } } = await Tesseract.recognize(buffer, 'por', {
-    logger: () => {},
+// ─── Claude Vision: extrai campos do relatório ────────────────────────────────
+async function parseComClaude(buffer, mimeType) {
+  const base64    = buffer.toString('base64');
+  const mediaType = (mimeType && mimeType.startsWith('image/')) ? mimeType : 'image/jpeg';
+
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5',
+    max_tokens: 1024,
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'image',
+          source: { type: 'base64', media_type: mediaType, data: base64 },
+        },
+        {
+          type: 'text',
+          text: `Você está analisando uma imagem de um relatório chamado "DIÁRIO DE BORDO" de desvio operacional de uma empresa de transporte.
+
+Extraia os seguintes campos e retorne SOMENTE um JSON válido, sem markdown, sem texto extra:
+
+{
+  "id": "valor do campo Identificação no topo direito (formato DI-XXXX)",
+  "evento": "tipo do evento — item 1 da tabela",
+  "placa": "placa do veículo — item 2",
+  "motorista": "nome completo do motorista/ajudante — item 3",
+  "dataDesvio": "data do desvio em formato YYYY-MM-DD — item 4",
+  "horario": "horário do desvio em HH:MM — item 5",
+  "turno": "NOTURNO ou DIURNO — item 6",
+  "reincidente": "SIM ou NÃO — item 7",
+  "unidade": "nome da unidade — item 9",
+  "supervisor": "nome do supervisor — item 10",
+  "gravidade": "ALTA, MÉDIA ou BAIXA — item 13",
+  "descricao": "descrição do evento — item 15",
+  "analise": "análise completa — item 16",
+  "respondente": "nome do respondente no cabeçalho",
+  "dataResposta": "data de resposta no cabeçalho em DD/MM/YYYY HH:MM"
+}
+
+Se um campo não estiver visível, use null. Não invente valores.`,
+        },
+      ],
+    }],
   });
-  return text;
+
+  const text = response.content[0].text.trim();
+  // Remove possíveis blocos markdown
+  const clean = text.replace(/^```json?\n?/, '').replace(/\n?```$/, '');
+  return JSON.parse(clean);
 }
 
-// ─── Detecta se o texto parece um relatório de desvio ─────────────────────────
-function isRelatorioDesvio(text) {
-  const keywords = ['DIÁRIO DE BORDO', 'DESVIO', 'MOTORISTA', 'GRAVIDADE', 'EVENTO', 'ANÁLISE', 'DI-'];
-  const upper = text.toUpperCase();
-  const matches = keywords.filter(k => upper.includes(k)).length;
-  return matches >= 3; // precisa ter pelo menos 3 palavras-chave
-}
-
-// ─── Parser robusto para OCR de imagem de formulário ─────────────────────────
-
-// Extrai primeiro match de um padrão, retorna '—' se não achar
-function ocr(text, ...patterns) {
-  for (const re of patterns) {
-    const m = text.match(re);
-    if (m) {
-      const val = (m[1] || m[0]).replace(/\s+/g, ' ').trim();
-      if (val.length > 1) return val;
-    }
-  }
-  return '—';
-}
-
-// Limpa valor OCR — remove sequências de ruído (letras isoladas, símbolos)
-function clean(val) {
-  if (!val || val === '—') return '—';
-  // Remove tokens com menos de 2 chars que não são números
-  const cleaned = val.replace(/\b[A-Za-z]\b/g, '').replace(/\s{2,}/g, ' ').trim();
-  return cleaned.length > 2 ? cleaned : '—';
-}
-
-function parseDesvioFromText(text) {
-  const T = text.toUpperCase();
-
-  // ── ID ──────────────────────────────────────────────────────────────────────
-  const id = ocr(text,
-    /(?:Identifica[çc][aã]o|ID)[:\s]+([A-Z]{2}-\d+)/i,
-    /\b(DI-\d{3,})\b/i
-  );
-  const idFinal = id !== '—' ? id.toUpperCase() : `DI-${Date.now().toString().slice(-6)}`;
-
-  // ── DATA (ISO sobrevive bem ao OCR) ──────────────────────────────────────────
-  const dataDesvio = ocr(text,
-    /DATA\s*(?:DO\s*)?DESVIO[^\d]*(202\d-\d{2}-\d{2})/i,
-    /\b(202\d-\d{2}-\d{2})\b/
-  );
-
-  // ── HORÁRIO ──────────────────────────────────────────────────────────────────
-  const horario = ocr(text, /\b(\d{2}:\d{2})\b/);
-
-  // ── TURNO ────────────────────────────────────────────────────────────────────
-  const turno = ocr(text, /\b(NOTURNO|DIURNO|MATUTINO|VESPERTINO)\b/i);
-
-  // ── EVENTO (busca palavras-chave conhecidas) ──────────────────────────────────
-  const eventosConhecidos = ['FADIGA', 'SONOLÊNCIA', 'SONOLENCIA', 'DISTRAÇÃO', 'DISTRACAO',
-    'DORMINDO', 'VELOCIDADE', 'CELULAR', 'CINTO', 'ABASTECIMENTO', 'MANUTENÇÃO'];
-  let evento = '—';
-  for (const e of eventosConhecidos) {
-    if (T.includes(e)) { evento = e.replace('SONOLENCIA','SONOLÊNCIA').replace('DISTRACAO','DISTRAÇÃO').replace('MANUTENCAO','MANUTENÇÃO'); break; }
-  }
-  // fallback: linha após "EVENTO" ou "DESCRIÇÃO DE EVENTO"
-  if (evento === '—') {
-    evento = ocr(text,
-      /DESCRI[ÇC][ÃA]O\s*DE\s*EVENTO\s*[\n\r]+([^\n\r]{5,60})/i,
-      /\bEVENTO\b[^\n]{0,10}\n([^\n]{5,60})/i
-    );
-  }
-
-  // ── GRAVIDADE ─────────────────────────────────────────────────────────────────
-  const gravidade = ocr(text, /\b(ALTA|M[ÉE]DIA|BAIXA|CR[ÍI]TICA)\b/i);
-
-  // ── PLACA ─────────────────────────────────────────────────────────────────────
-  const placa = ocr(text,
-    /PLACA[^\n]{0,20}\n([A-Z0-9\-]{5,12})/i,
-    /\b([A-Z]{2,4}[\d]{3,4}[A-Z\d]{0,4})\b/
-  );
-
-  // ── MOTORISTA ────────────────────────────────────────────────────────────────
-  // Nomes próprios: 2-5 palavras capitalizadas, cada uma com >=2 chars
-  let motorista = ocr(text,
-    /(?:NOME DO MOTORISTA|AJUDANTE QUE COMETEU)[^\n]*\n([A-ZÁÉÍÓÚÀÃÕÂÊÔÇÑ][a-záéíóúàãõâêôçñ]+(?: [A-ZÁÉÍÓÚÀÃÕÂÊÔÇÑ][a-záéíóúàãõâêôçñ]+){1,4})/i,
-    /(?:MOTORISTA|CONDUTOR)[^\n]{0,30}\n([A-Z][a-z]+(?: [A-Z][a-z]+){1,4})/i
-  );
-  // fallback: nome em CAIXA ALTA de 2-5 palavras
-  if (motorista === '—') {
-    const capsName = text.match(/\b([A-ZÁÉÍÓÚÀÃÕÂÊÔÇ]{2,}\s+[A-ZÁÉÍÓÚÀÃÕÂÊÔÇ]{2,}(?:\s+[A-ZÁÉÍÓÚÀÃÕÂÊÔÇ]{2,}){0,3})\b/);
-    if (capsName) motorista = capsName[1].trim();
-  }
-
-  // ── REINCIDENTE ───────────────────────────────────────────────────────────────
-  const reincidente = ocr(text, /REINCIDENTE[^\n]*(SIM|N[ÃA]O)/i);
-
-  // ── UNIDADE ───────────────────────────────────────────────────────────────────
-  const unidade = ocr(text,
-    /UNIDADE[^\n]*\n([A-Z][A-Z\s]{3,30})/i,
-    /\b(SEACREST|BENELLOG|BNL)[^\n]{0,20}/i
-  );
-
-  // ── SUPERVISOR ────────────────────────────────────────────────────────────────
-  const supervisor = ocr(text,
-    /SUPERVISOR[^\n]*\n([A-ZÁÉÍÓÚÀÃÕÂÊÔÇ][a-záéíóúàãõâêôç]+(?: [A-ZÁÉÍÓÚÀÃÕÂÊÔÇ][a-záéíóúàãõâêôç]+){0,3})/i,
-    /SUPERVISOR[:\s]+([A-Z][a-z]+(?: [A-Z][a-z]+){0,3})/i
-  );
-
-  // ── ANÁLISE (bloco de texto longo) ────────────────────────────────────────────
-  const analise = ocr(text,
-    /AN[ÁA]LISE\s*[\n\r]+(.{40,600}?)(?:\n\n|\d{2}\/\d{2}|\d{4}-\d{2}|$)/is,
-    /AN[ÁA]LISE[:\s]+(.{40,400})/is
-  );
-
+// ─── Parse PDF com pdf-parse ──────────────────────────────────────────────────
+async function parseComPdfParse(buffer) {
+  const data = await pdfParse(buffer);
+  // Para PDFs também usamos Claude Vision convertendo para texto estruturado
+  // mas primeiro tenta extrair direto se o texto for legível
+  const text = data.text;
+  const idMatch = text.match(/DI-\d+/i);
+  if (!idMatch) throw new Error('PDF sem ID de desvio');
+  // Usa o texto extraído para montar campos básicos
   return {
-    id:          idFinal,
-    evento,
-    placa:       clean(placa),
-    motorista:   clean(motorista),
-    dataDesvio,
-    horario,
-    turno,
-    reincidente,
-    unidade:     clean(unidade),
-    supervisor:  clean(supervisor),
-    gravidade,
-    descricao:   evento,
-    analise:     analise !== '—' ? analise.replace(/\s+/g, ' ').trim().slice(0, 500) : '—',
-    autor:       '—',
-    respondente: '—',
-    dataResposta: '—',
-    status:      'PENDENTE',
-    criadoEm:    new Date().toISOString(),
-    rawText:     text,
+    id:          (text.match(/DI-\d+/i)?.[0] || `DI-${Date.now().toString().slice(-6)}`).toUpperCase(),
+    evento:      text.match(/\bFADIGA\b|\bDISTRAÇÃO\b|\bSONOLÊNCIA\b|\bDORMINDO\b/i)?.[0] || null,
+    placa:       text.match(/PLACA[^\n]*\n([A-Z0-9\-]{5,12})/i)?.[1]?.trim() || null,
+    motorista:   text.match(/NOME DO MOTORISTA[^\n]*\n([^\n]{5,50})/i)?.[1]?.trim() || null,
+    dataDesvio:  text.match(/\b(202\d-\d{2}-\d{2})\b/)?.[1] || null,
+    horario:     text.match(/\b(\d{2}:\d{2})\b/)?.[1] || null,
+    turno:       text.match(/\b(NOTURNO|DIURNO)\b/i)?.[1]?.toUpperCase() || null,
+    reincidente: text.match(/REINCIDENTE[^\n]*(SIM|NÃO|NAO)/i)?.[1]?.toUpperCase() || null,
+    unidade:     text.match(/UNIDADE[^\n]*\n([^\n]{3,30})/i)?.[1]?.trim() || null,
+    supervisor:  text.match(/SUPERVISOR[^\n]*\n([^\n]{3,40})/i)?.[1]?.trim() || null,
+    gravidade:   text.match(/\b(ALTA|MÉDIA|MEDIA|BAIXA)\b/i)?.[1]?.toUpperCase().replace('MEDIA','MÉDIA') || null,
+    descricao:   text.match(/DESCRIÇÃO DE EVENTO[^\n]*\n([^\n]{5,})/i)?.[1]?.trim() || null,
+    analise:     text.match(/ANÁLISE[^\n]*\n([\s\S]{20,400}?)(?:\n\n|\d{2}\/\d{2}|$)/i)?.[1]?.replace(/\s+/g,' ').trim() || null,
+    respondente: text.match(/Respondente:\s*([^\n]+)/i)?.[1]?.trim() || null,
+    dataResposta: text.match(/Data de Resposta:\s*([^\n]+)/i)?.[1]?.trim() || null,
   };
 }
 
-// ─── Roteador: PDF ou imagem ──────────────────────────────────────────────────
-async function parseDocument(buffer, mimeType) {
-  const isPdf = mimeType === 'application/pdf';
-  const isImg = mimeType?.startsWith('image/') || !mimeType;
-
-  let text;
-  if (isPdf) {
-    const data = await pdfParse(buffer);
-    text = data.text;
-  } else if (isImg) {
-    text = await ocrImage(buffer);
-    console.log('[OCR] Texto extraído (primeiros 300 chars):', text.slice(0, 300));
-  } else {
-    throw new Error(`Tipo não suportado: ${mimeType}`);
-  }
-
-  if (!isRelatorioDesvio(text)) {
-    throw new Error('NÃO_RELATORIO'); // sinal para ignorar sem erro
-  }
-
-  return parseDesvioFromText(text);
+// ─── Detecta se é relatório de desvio ────────────────────────────────────────
+function isRelatorioDesvio(campos) {
+  // Tem ID no formato DI- OU tem pelo menos 3 campos preenchidos
+  if (campos.id && /DI-\d+/i.test(campos.id)) return true;
+  const preenchidos = Object.values(campos).filter(v => v && v !== 'null').length;
+  return preenchidos >= 4;
 }
 
-// ─── Gravidade emoji ──────────────────────────────────────────────────────────
+// ─── Monta registro do desvio ─────────────────────────────────────────────────
+function montarDesvio(campos) {
+  const id = (campos.id && /DI-\d+/i.test(campos.id))
+    ? campos.id.toUpperCase()
+    : `DI-${Date.now().toString().slice(-6)}`;
+
+  return {
+    id,
+    evento:       campos.evento      || '—',
+    placa:        campos.placa       || '—',
+    motorista:    campos.motorista   || '—',
+    dataDesvio:   campos.dataDesvio  || '—',
+    horario:      campos.horario     || '—',
+    turno:        campos.turno       || '—',
+    reincidente:  campos.reincidente || '—',
+    unidade:      campos.unidade     || '—',
+    supervisor:   campos.supervisor  || '—',
+    gravidade:    campos.gravidade   || '—',
+    descricao:    campos.descricao   || '—',
+    analise:      campos.analise     || '—',
+    respondente:  campos.respondente || '—',
+    dataResposta: campos.dataResposta || '—',
+    status:       'PENDENTE',
+    criadoEm:     new Date().toISOString(),
+  };
+}
+
+// ─── Processa mídia (foto ou documento) ──────────────────────────────────────
+async function processarMidia(buffer, mimeType, origem) {
+  let campos;
+  const isPdf = mimeType === 'application/pdf';
+
+  if (isPdf) {
+    campos = await parseComPdfParse(buffer);
+  } else {
+    // Imagem → Claude Vision
+    campos = await parseComClaude(buffer, mimeType);
+  }
+
+  if (!isRelatorioDesvio(campos)) {
+    console.log(`[${origem}] Ignorado: não parece relatório de desvio`);
+    return null;
+  }
+
+  return montarDesvio(campos);
+}
+
+// ─── Emojis ───────────────────────────────────────────────────────────────────
 function gravidadeEmoji(g) {
-  const lower = (g || '').toLowerCase();
-  if (lower.includes('alta') || lower.includes('crítica')) return '🔴';
-  if (lower.includes('média') || lower.includes('media'))  return '🟡';
-  if (lower.includes('baixa'))                             return '🟢';
+  const l = (g || '').toLowerCase();
+  if (l.includes('alta') || l.includes('crítica')) return '🔴';
+  if (l.includes('média') || l.includes('media'))  return '🟡';
+  if (l.includes('baixa'))                         return '🟢';
   return '⚪';
 }
+function statusEmoji(s) {
+  if (s === 'PENDENTE')     return '🔴';
+  if (s === 'EM_TRATATIVA') return '🟡';
+  if (s === 'CONCLUIDO')    return '✅';
+  return '⚪';
+}
+function campo(label, val) {
+  return (val && val !== '—') ? `${label} ${val}\n` : '';
+}
 
-// ─── Formata resumo do desvio ─────────────────────────────────────────────────
-function formatResumo(d, { completo = false } = {}) {
-  const gEmoji = gravidadeEmoji(d.gravidade);
-  const reincIcon = d.reincidente?.toLowerCase().includes('sim') ? '⚠️ *REINCIDENTE*\n' : '';
+// ─── Formata resumo ───────────────────────────────────────────────────────────
+function formatResumo(d, completo = false) {
+  const gEmoji   = gravidadeEmoji(d.gravidade);
+  const reincAviso = (d.reincidente || '').toUpperCase() === 'SIM' ? '⚠️ *REINCIDENTE*\n' : '';
 
   let msg =
-    `🚨 *Novo Desvio Identificado — ${d.id}*\n` +
-    reincIcon +
+    `🚨 *Desvio ${d.id}* ${statusEmoji(d.status)}\n` +
+    reincAviso + `\n` +
+    campo('👤 *Motorista:*', d.motorista) +
+    campo('🚛 *Placa:*', d.placa) +
+    campo(`📅 *Data/Hora:*`, d.dataDesvio && d.horario !== '—'
+      ? `${d.dataDesvio} às ${d.horario} (${d.turno})`
+      : d.dataDesvio || d.horario) +
+    campo('📍 *Unidade:*', d.unidade) +
+    campo('👔 *Supervisor:*', d.supervisor) +
     `\n` +
-    `👤 *Motorista:* ${d.motorista}\n` +
-    `🚛 *Placa:* ${d.placa}\n` +
-    `📅 *Data/Hora:* ${d.dataDesvio} às ${d.horario} (${d.turno})\n` +
-    `📍 *Unidade:* ${d.unidade}\n` +
-    `👔 *Supervisor:* ${d.supervisor}\n` +
-    `\n` +
-    `⚡ *Evento:* ${d.evento}\n` +
-    `${gEmoji} *Gravidade:* ${d.gravidade}\n` +
-    `\n` +
-    `📝 *Descrição:* ${d.descricao}\n`;
+    campo('⚡ *Evento:*', d.evento) +
+    `${gEmoji} *Gravidade:* ${d.gravidade}\n`;
 
-  if (completo) {
-    msg +=
-      `\n📊 *Análise:*\n${d.analise}\n` +
-      `\n` +
-      `📋 *Respondente:* ${d.respondente}\n` +
-      `🕐 *Data Resposta:* ${d.dataResposta}\n`;
+  if (d.descricao && d.descricao !== '—' && d.descricao !== d.evento) {
+    msg += `\n📝 *Descrição:* ${d.descricao}\n`;
   }
 
-  msg +=
-    `\n─────────────────────\n` +
-    `📌 *Status:* ${d.status}\n` +
-    `\nDigite *sim* para iniciar a tratativa ou *não* para ignorar.`;
+  if (completo && d.analise && d.analise !== '—') {
+    msg += `\n📊 *Análise:*\n${d.analise.slice(0, 600)}\n`;
+    if (d.respondente && d.respondente !== '—') {
+      msg += `\n📋 *Respondente:* ${d.respondente}\n`;
+      msg += campo('🕐 *Data Resposta:*', d.dataResposta);
+    }
+  }
+
+  msg += `\n─────────────────\n📌 *Status:* ${d.status}`;
+
+  if (d.status === 'PENDENTE') {
+    msg += `\n\nDigite *sim* para iniciar tratativa ou *não* para ignorar.`;
+  }
 
   return msg;
 }
 
-// ─── Envia resumo ao usuário ──────────────────────────────────────────────────
+// ─── Notifica novo desvio ─────────────────────────────────────────────────────
 async function notificarDesvio(desvio) {
   pendingAcao = { desvioId: desvio.id, aguardando: 'confirmacao' };
-  saveState();
+  await saveBackup();
   await bot.sendMessage(MY_CHAT_ID, formatResumo(desvio), { parse_mode: 'Markdown' });
-  console.log(`[BOT] Desvio ${desvio.id} notificado ao usuário`);
+  console.log(`[BOT] Desvio ${desvio.id} notificado — ${desvio.motorista}`);
 }
 
-// ─── Telegram bot commands ────────────────────────────────────────────────────
+// ─── Comandos do bot ──────────────────────────────────────────────────────────
 bot.on('message', async (msg) => {
   if (String(msg.chat.id) !== String(MY_CHAT_ID)) return;
   const text = (msg.text || '').trim();
   if (!text) return;
 
-  // /desvios — lista todos os desvios
+  // ── /desvios ────────────────────────────────────────────────────────────────
   if (text === '/desvios') {
     const list = Object.values(desvios);
-    if (list.length === 0) {
-      await bot.sendMessage(MY_CHAT_ID, '✅ Nenhum desvio registrado.');
-      return;
-    }
-    const pendentes   = list.filter(d => d.status === 'PENDENTE');
-    const tratativas  = list.filter(d => d.status === 'EM_TRATATIVA');
-    const concluidos  = list.filter(d => d.status === 'CONCLUIDO');
+    if (list.length === 0) { await bot.sendMessage(MY_CHAT_ID, '✅ Nenhum desvio registrado.'); return; }
 
-    const linha = (d) => {
-      const nome = d.motorista !== '—' ? d.motorista : '(nome não extraído)';
-      const evt  = d.evento    !== '—' ? d.evento    : '';
-      const data = d.dataDesvio !== '—' ? d.dataDesvio : d.criadoEm?.slice(0,10) || '';
-      return `  • \`${d.id}\` ${nome}${evt ? ' | ' + evt : ''}${data ? ' | ' + data : ''}\n`;
+    const grupos = {
+      PENDENTE:     list.filter(d => d.status === 'PENDENTE'),
+      EM_TRATATIVA: list.filter(d => d.status === 'EM_TRATATIVA'),
+      CONCLUIDO:    list.filter(d => d.status === 'CONCLUIDO'),
     };
 
-    let msg = `📋 *Desvios*\n\n`;
-    if (pendentes.length) {
-      msg += `🔴 *Pendentes (${pendentes.length}):*\n`;
-      pendentes.forEach(d => { msg += linha(d); });
-    }
-    if (tratativas.length) {
-      msg += `\n🟡 *Em Tratativa (${tratativas.length}):*\n`;
-      tratativas.forEach(d => { msg += linha(d); });
-    }
-    if (concluidos.length) {
-      msg += `\n✅ *Concluídos (${concluidos.length}):*\n`;
-      concluidos.slice(-5).forEach(d => { msg += linha(d); });
-    }
-    await bot.sendMessage(MY_CHAT_ID, msg, { parse_mode: 'Markdown' });
+    const linha = (d) => {
+      const data  = d.dataDesvio !== '—' ? d.dataDesvio : d.criadoEm?.slice(0,10);
+      const nome  = d.motorista  !== '—' ? d.motorista  : '(nome não identificado)';
+      const evt   = d.evento     !== '—' ? ` | ${d.evento}` : '';
+      const grav  = d.gravidade  !== '—' ? ` ${gravidadeEmoji(d.gravidade)}` : '';
+      return `  • \`${d.id}\`${grav} ${nome}${evt} | ${data}\n`;
+    };
+
+    let msgOut = `📋 *Desvios — ${list.length} total*\n\n`;
+    if (grupos.PENDENTE.length)     { msgOut += `🔴 *Pendentes (${grupos.PENDENTE.length}):*\n`;     grupos.PENDENTE.forEach(d => { msgOut += linha(d); }); }
+    if (grupos.EM_TRATATIVA.length) { msgOut += `\n🟡 *Em Tratativa (${grupos.EM_TRATATIVA.length}):*\n`; grupos.EM_TRATATIVA.forEach(d => { msgOut += linha(d); }); }
+    if (grupos.CONCLUIDO.length)    { msgOut += `\n✅ *Concluídos (${grupos.CONCLUIDO.length}):*\n`; grupos.CONCLUIDO.slice(-5).forEach(d => { msgOut += linha(d); }); }
+    msgOut += `\n_Use /desvio DI-XXXX para detalhes_`;
+
+    await bot.sendMessage(MY_CHAT_ID, msgOut, { parse_mode: 'Markdown' });
     return;
   }
 
-  // /desvio ID — detalhe completo
-  const desvioCmd = text.match(/^\/desvio\s+([A-Z]{2}-\d+)/i);
+  // ── /desvio ID ──────────────────────────────────────────────────────────────
+  const desvioCmd = text.match(/^\/desvio\s+([A-Z]{2}-[\dA-Z]+)/i);
   if (desvioCmd) {
     const id = desvioCmd[1].toUpperCase();
     const d  = desvios[id];
-    if (!d) {
-      await bot.sendMessage(MY_CHAT_ID, `❌ Desvio \`${id}\` não encontrado.`, { parse_mode: 'Markdown' });
-      return;
-    }
-    await bot.sendMessage(MY_CHAT_ID, formatResumo(d, { completo: true }), { parse_mode: 'Markdown' });
+    if (!d) { await bot.sendMessage(MY_CHAT_ID, `❌ \`${id}\` não encontrado.`, { parse_mode: 'Markdown' }); return; }
+    await bot.sendMessage(MY_CHAT_ID, formatResumo(d, true), { parse_mode: 'Markdown' });
     return;
   }
 
-  // DD/MM/YYYY — desvios da data
-  const dateMatch = text.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
-  if (dateMatch) {
-    const [, dd, mm, yyyy] = dateMatch;
-    // Monta variações do formato que pode vir do PDF (2026-05-12, 13/05/2026, 2026/05/13...)
-    const isoDate   = `${yyyy}-${mm}-${dd}`;   // 2026-05-12
-    const brDate    = `${dd}/${mm}/${yyyy}`;    // 12/05/2026
-    const brDate2   = `${dd}/${mm}`;            // 12/05 (parcial)
-
-    const found = Object.values(desvios).filter(d => {
-      const dv = (d.dataDesvio || '') + (d.criadoEm || '');
-      return dv.includes(isoDate) || dv.includes(brDate) || dv.includes(brDate2);
-    });
-
-    if (found.length === 0) {
-      await bot.sendMessage(MY_CHAT_ID, `📭 Nenhum desvio registrado em *${brDate}*.`, { parse_mode: 'Markdown' });
-      return;
-    }
-
-    const gEmoji = (g) => {
-      const l = (g || '').toLowerCase();
-      if (l.includes('alta') || l.includes('crítica')) return '🔴';
-      if (l.includes('média') || l.includes('media'))  return '🟡';
-      if (l.includes('baixa'))                         return '🟢';
-      return '⚪';
-    };
-    const statusIcon = (s) => s === 'PENDENTE' ? '🔴' : s === 'EM_TRATATIVA' ? '🟡' : '✅';
-
-    let msg = `📅 *Desvios em ${brDate}* — ${found.length} registro(s)\n\n`;
-    found.forEach((d, i) => {
-      msg +=
-        `*${i + 1}. ${d.id}* ${statusIcon(d.status)}\n` +
-        `👤 ${d.motorista}\n` +
-        `⚡ ${d.evento} ${gEmoji(d.gravidade)} ${d.gravidade}\n` +
-        `🕐 ${d.horario} | 🚛 ${d.placa}\n` +
-        `📌 ${d.status}\n\n`;
-    });
-    msg += `_Use /desvio ID para detalhes completos_`;
-
-    await bot.sendMessage(MY_CHAT_ID, msg, { parse_mode: 'Markdown' });
-    return;
-  }
-
-  // /pendentes — atalho para pendentes
+  // ── /pendentes ──────────────────────────────────────────────────────────────
   if (text === '/pendentes') {
-    const pendentes = Object.values(desvios).filter(d => d.status === 'PENDENTE');
-    if (pendentes.length === 0) {
-      await bot.sendMessage(MY_CHAT_ID, '✅ Nenhum desvio pendente.');
-      return;
-    }
-    for (const d of pendentes.slice(0, 5)) {
+    const pend = Object.values(desvios).filter(d => d.status === 'PENDENTE');
+    if (pend.length === 0) { await bot.sendMessage(MY_CHAT_ID, '✅ Nenhum desvio pendente.'); return; }
+    for (const d of pend.slice(0, 5)) {
       await bot.sendMessage(MY_CHAT_ID, formatResumo(d), { parse_mode: 'Markdown' });
     }
     return;
   }
 
-  // Resposta à confirmação de tratativa
+  // ── DD/MM/YYYY ──────────────────────────────────────────────────────────────
+  const dateMatch = text.match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (dateMatch) {
+    const [, dd, mm, yyyy] = dateMatch;
+    const iso   = `${yyyy}-${mm}-${dd}`;
+    const brFmt = `${dd}/${mm}/${yyyy}`;
+
+    const encontrados = Object.values(desvios).filter(d => {
+      const dv = (d.dataDesvio || '') + (d.criadoEm || '');
+      return dv.includes(iso) || dv.includes(brFmt);
+    }).sort((a, b) => (a.dataDesvio || '').localeCompare(b.dataDesvio || ''));
+
+    if (encontrados.length === 0) {
+      await bot.sendMessage(MY_CHAT_ID, `📭 Nenhum desvio em *${brFmt}*.`, { parse_mode: 'Markdown' });
+      return;
+    }
+
+    let msg = `📅 *Desvios em ${brFmt}* — ${encontrados.length} registro(s)\n\n`;
+    encontrados.forEach((d, i) => {
+      msg +=
+        `*${i+1}. ${d.id}* ${statusEmoji(d.status)} ${gravidadeEmoji(d.gravidade)}\n` +
+        `👤 ${d.motorista !== '—' ? d.motorista : '—'}\n` +
+        `⚡ ${d.evento} | 🕐 ${d.horario}\n` +
+        (d.placa !== '—' ? `🚛 ${d.placa}\n` : '') +
+        `📌 ${d.status}\n\n`;
+    });
+    msg += `_Use /desvio DI-XXXX para detalhes completos_`;
+    await bot.sendMessage(MY_CHAT_ID, msg, { parse_mode: 'Markdown' });
+    return;
+  }
+
+  // ── /sincronizar [dias] ─────────────────────────────────────────────────────
+  const sincMatch = text.match(/^\/sincronizar(?:\s+(\d+))?$/i);
+  if (sincMatch) {
+    const dias = parseInt(sincMatch[1] || '7');
+    await bot.sendMessage(MY_CHAT_ID, `🔄 Buscando relatórios dos últimos *${dias} dias*...`, { parse_mode: 'Markdown' });
+    sincronizarGrupo(dias).catch(err => bot.sendMessage(MY_CHAT_ID, `❌ Erro: ${err.message}`));
+    return;
+  }
+
+  // ── Confirmação de tratativa ────────────────────────────────────────────────
   if (pendingAcao?.aguardando === 'confirmacao') {
     const lower = text.toLowerCase();
     const id    = pendingAcao.desvioId;
     const d     = desvios[id];
 
     if (lower === 'sim' || lower === 's') {
-      if (d) {
-        d.status = 'EM_TRATATIVA';
-        await saveBackup();
-        await bot.sendMessage(MY_CHAT_ID,
-          `✅ Desvio \`${id}\` marcado como *EM TRATATIVA*.\n\n` +
-          `📧 Em breve: envio automático de e-mail ao supervisor ${d.supervisor}.`,
-          { parse_mode: 'Markdown' });
-        console.log(`[BOT] Desvio ${id} → EM_TRATATIVA`);
-      }
-      pendingAcao = null;
-      await saveBackup();
-      return;
-    }
-
-    if (lower === 'não' || lower === 'nao' || lower === 'n') {
+      if (d) { d.status = 'EM_TRATATIVA'; await saveBackup(); }
       await bot.sendMessage(MY_CHAT_ID,
-        `⏭ Desvio \`${id}\` mantido como *PENDENTE*. Use /desvio ${id} para retomar.`,
+        `✅ Desvio \`${id}\` → *EM TRATATIVA*\n📧 Em breve: envio automático de e-mail.`,
         { parse_mode: 'Markdown' });
       pendingAcao = null;
       await saveBackup();
       return;
     }
+    if (lower === 'não' || lower === 'nao' || lower === 'n') {
+      await bot.sendMessage(MY_CHAT_ID, `⏭ \`${id}\` mantido como PENDENTE.`, { parse_mode: 'Markdown' });
+      pendingAcao = null;
+      await saveBackup();
+      return;
+    }
   }
 
-  // /sincronizar [dias] — busca PDFs antigos do grupo
-  const sincMatch = text.match(/^\/sincronizar(?:\s+(\d+))?$/i);
-  if (sincMatch) {
-    const dias = parseInt(sincMatch[1] || '7');
-    await bot.sendMessage(MY_CHAT_ID, `🔄 Buscando PDFs dos últimos *${dias} dias* no grupo...`, { parse_mode: 'Markdown' });
-    sincronizarGrupo(dias).catch(err =>
-      bot.sendMessage(MY_CHAT_ID, `❌ Erro na sincronização: ${err.message}`)
-    );
-    return;
-  }
-
-  // Help
+  // ── Help ────────────────────────────────────────────────────────────────────
   await bot.sendMessage(MY_CHAT_ID,
+    `*Desvios Bot*\n\n` +
     `Comandos:\n` +
-    `/desvios — lista todos os desvios\n` +
-    `/desvio DI-0001 — detalhes do desvio\n` +
+    `/desvios — lista completa\n` +
+    `/desvio DI-0001 — detalhes\n` +
     `/pendentes — aguardando tratativa\n` +
-    `/sincronizar 7 — reprocessa PDFs dos últimos N dias\n\n` +
-    `DD/MM/AAAA — desvios de uma data específica\n\n` +
-    `Quando um novo relatório chegar, responda *sim* ou *não*.`);
+    `/sincronizar 7 — importar últimos N dias\n\n` +
+    `DD/MM/AAAA — desvios de uma data\n\n` +
+    `Quando um relatório chegar, responda *sim* ou *não*.`,
+    { parse_mode: 'Markdown' });
 });
 
 // ─── Referências globais ao userbot ──────────────────────────────────────────
@@ -472,83 +422,64 @@ let userbotGroupId = null;
 // ─── Sincronização retroativa ─────────────────────────────────────────────────
 async function sincronizarGrupo(dias = 7) {
   if (!userbotClient || !userbotGroupId) {
-    await bot.sendMessage(MY_CHAT_ID, '❌ Userbot não conectado. Verifique as variáveis TELEGRAM_API_ID/HASH/SESSION.');
+    await bot.sendMessage(MY_CHAT_ID, '❌ Userbot não conectado.');
     return;
   }
 
-  const limitDate = new Date();
-  limitDate.setDate(limitDate.getDate() - dias);
-  const limitTs = Math.floor(limitDate.getTime() / 1000);
-
+  const limitTs = Math.floor((Date.now() - dias * 86400000) / 1000);
   let novos = 0, ignorados = 0, erros = 0;
+
   const messages = await userbotClient.getMessages(userbotGroupId, { limit: 300 });
-  console.log(`[SINC] Total de mensagens no grupo: ${messages.length}`);
+  const candidatos = messages.filter(m => {
+    if (m.date < limitTs) return false;
+    if (SENDER_ID && Number(m.senderId) !== SENDER_ID) return false;
+    return !!(m.media?.photo || m.media?.document);
+  });
 
-  for (const m of messages) {
-    if (m.date < limitTs) continue;
+  console.log(`[SINC] ${candidatos.length} mensagens com mídia do sender no período`);
 
-    // Filtra remetente (log para debug)
-    if (SENDER_ID && Number(m.senderId) !== SENDER_ID) continue;
+  for (const m of candidatos) {
+    const hasPhoto = !!m.media?.photo;
+    const doc      = m.media?.document;
+    let mimeType   = 'image/jpeg';
 
-    const media    = m.media;
-    const hasDoc   = !!media?.document;
-    const hasPhoto = !!media?.photo;
-    if (!hasDoc && !hasPhoto) continue;
-
-    let mimeType = 'image/jpeg';
-    if (hasDoc) {
-      const doc  = media.document;
-      mimeType   = doc.mimeType || '';
-      const fn   = doc.attributes?.find(a => a.fileName)?.fileName || '';
-      const isImg = mimeType.startsWith('image/');
+    if (doc) {
+      mimeType = doc.mimeType || '';
+      const fn = doc.attributes?.find(a => a.fileName)?.fileName || '';
       const isPdf = mimeType === 'application/pdf' || fn.toLowerCase().endsWith('.pdf');
-      if (!isImg && !isPdf) {
-        console.log(`[SINC] Ignorando doc tipo: ${mimeType} "${fn}"`);
-        continue;
-      }
+      const isImg = mimeType.startsWith('image/');
+      if (!isPdf && !isImg) { console.log(`[SINC] Ignorando ${mimeType}`); continue; }
     }
-
-    console.log(`[SINC] Processando msg ${m.id} tipo=${mimeType} foto=${hasPhoto} sender=${m.senderId}`);
 
     try {
       const buffer = await userbotClient.downloadMedia(m, {});
-      if (!buffer || buffer.length === 0) { console.log(`[SINC] Buffer vazio msg ${m.id}`); continue; }
+      if (!buffer || buffer.length === 0) continue;
 
-      const desvio = await parseDocument(buffer, mimeType);
-
+      const desvio = await processarMidia(buffer, mimeType, 'SINC');
+      if (!desvio) { ignorados++; continue; }
       if (desvios[desvio.id]) { ignorados++; continue; }
 
       desvios[desvio.id] = desvio;
       novos++;
-      console.log(`[SINC] Novo desvio importado: ${desvio.id} — ${desvio.motorista}`);
+      console.log(`[SINC] Importado: ${desvio.id} — ${desvio.motorista}`);
     } catch (err) {
-      if (err.message === 'NÃO_RELATORIO') { console.log(`[SINC] Msg ${m.id}: não é relatório de desvio`); continue; }
       console.error(`[SINC] Erro msg ${m.id}:`, err.message);
       erros++;
     }
   }
 
-  // Log de senders encontrados no período (ajuda a confirmar o SENDER_ID certo)
-  const sendersNoGrupo = [...new Set(
-    messages
-      .filter(m => m.date >= limitTs && (m.media?.photo || m.media?.document))
-      .map(m => String(m.senderId))
-  )];
-  console.log(`[SINC] Senders com mídia no período: ${sendersNoGrupo.join(', ') || 'nenhum'}`);
-
   await saveBackup();
   await bot.sendMessage(MY_CHAT_ID,
     `✅ *Sincronização concluída!*\n` +
-    `📥 ${novos} novo(s) | ⏭ ${ignorados} já existia(m) | ❌ ${erros} erro(s)\n\n` +
-    (novos > 0 ? `Use /desvios para ver a lista completa.` : `Nenhum relatório de desvio encontrado.\nVerifique o log do Railway para detalhes.`),
+    `📥 ${novos} novo(s) | ⏭ ${ignorados} ignorado(s) | ❌ ${erros} erro(s)\n\n` +
+    (novos > 0 ? `Use /desvios para ver.` : `Nenhum relatório novo encontrado.`),
     { parse_mode: 'Markdown' });
 }
 
-// ─── Userbot (monitora o grupo) ───────────────────────────────────────────────
+// ─── Userbot ──────────────────────────────────────────────────────────────────
 async function startUserbot() {
   if (!API_ID || !API_HASH || !SESSION_STR) {
-    console.warn('[USERBOT] TELEGRAM_API_ID / API_HASH / SESSION não configurados — monitoramento de grupo desativado.');
-    console.warn('[USERBOT] Execute "npm run auth" localmente para gerar a sessão.');
+    console.warn('[USERBOT] Credenciais MTProto não configuradas.');
     return;
   }
 
@@ -557,23 +488,24 @@ async function startUserbot() {
   });
 
   await client.connect();
-  console.log('[USERBOT] Conectado como usuário.');
+  console.log('[USERBOT] Conectado.');
 
-  // Encontra o grupo pelo nome
-  let targetGroupId = null;
+  // Encontra grupo
   const dialogs = await client.getDialogs({ limit: 100 });
   for (const d of dialogs) {
     if (d.title && d.title.toLowerCase().includes(GROUP_NAME.toLowerCase())) {
-      targetGroupId = d.id;
-      console.log(`[USERBOT] Grupo encontrado: "${d.title}" (ID: ${d.id})`);
+      userbotGroupId = d.id;
+      console.log(`[USERBOT] Grupo: "${d.title}" (${d.id})`);
       break;
     }
   }
 
-  if (!targetGroupId) {
-    console.error(`[USERBOT] Grupo "${GROUP_NAME}" não encontrado. Verifique TELEGRAM_GROUP_NAME.`);
+  if (!userbotGroupId) {
+    console.error(`[USERBOT] Grupo "${GROUP_NAME}" não encontrado.`);
     return;
   }
+
+  userbotClient = client;
 
   // Listener de novas mensagens
   client.addEventHandler(async (event) => {
@@ -581,63 +513,43 @@ async function startUserbot() {
       const message = event.message;
       if (!message) return;
 
-      // Filtra pelo grupo
-      const chatId = message.peerId?.channelId || message.peerId?.chatId;
-      const absGroupId = Math.abs(Number(targetGroupId));
-      if (Math.abs(Number(chatId)) !== absGroupId) return;
+      // Filtra grupo
+      const peerId   = message.peerId;
+      const chatId   = peerId?.channelId ?? peerId?.chatId ?? peerId?.userId;
+      const absGroup = BigInt(String(userbotGroupId).replace('-100', '').replace('-', ''));
+      if (BigInt(String(chatId ?? 0)) !== absGroup) return;
 
-      // Filtra pelo remetente (se configurado)
+      // Filtra sender
       if (SENDER_ID && Number(message.senderId) !== SENDER_ID) return;
 
-      // Verifica se tem mídia (documento ou foto)
-      const media = message.media;
-      if (!media) return;
-
-      const hasDoc   = !!media.document;
-      const hasPhoto = !!media.photo;
-      if (!hasDoc && !hasPhoto) return;
+      const media    = message.media;
+      const hasPhoto = !!media?.photo;
+      const doc      = media?.document;
+      if (!hasPhoto && !doc) return;
 
       let mimeType = 'image/jpeg';
-      let fileName = 'imagem';
-      if (hasDoc) {
-        const doc = media.document;
-        mimeType  = doc.mimeType || '';
-        fileName  = doc.attributes?.find(a => a.fileName)?.fileName || 'arquivo';
-        // Ignora arquivos que claramente não são relevantes (ex: vídeos)
+      if (doc) {
+        mimeType = doc.mimeType || '';
+        const fn = doc.attributes?.find(a => a.fileName)?.fileName || '';
+        const isPdf = mimeType === 'application/pdf' || fn.toLowerCase().endsWith('.pdf');
         const isImg = mimeType.startsWith('image/');
-        const isPdf = mimeType === 'application/pdf' || fileName.toLowerCase().endsWith('.pdf');
-        if (!isImg && !isPdf) return;
+        if (!isPdf && !isImg) return;
       }
 
-      console.log(`[USERBOT] Mídia recebida: "${fileName}" (${mimeType}) de sender ${message.senderId}`);
+      console.log(`[USERBOT] Nova mídia recebida — tipo: ${mimeType}, foto: ${hasPhoto}`);
 
-      // Download
       const buffer = await client.downloadMedia(message, {});
-      if (!buffer || buffer.length === 0) {
-        console.error('[USERBOT] Buffer vazio ao baixar mídia');
+      if (!buffer || buffer.length === 0) return;
+
+      const desvio = await processarMidia(buffer, mimeType, 'USERBOT');
+      if (!desvio) return;
+
+      if (desvios[desvio.id]) {
+        console.log(`[USERBOT] Desvio ${desvio.id} já existe, ignorando.`);
         return;
       }
 
-      // Parse (PDF ou OCR de imagem)
-      let desvio;
-      try {
-        desvio = await parseDocument(buffer, mimeType);
-      } catch (err) {
-        if (err.message === 'NÃO_RELATORIO') {
-          console.log('[USERBOT] Imagem ignorada: não é relatório de desvio');
-          return;
-        }
-        console.error('[USERBOT] Erro ao parsear mídia:', err.message);
-        await bot.sendMessage(MY_CHAT_ID,
-          `⚠️ Recebi uma imagem do grupo mas não consegui extrair os dados.\nArquivo: ${fileName}\nErro: ${err.message}`);
-        return;
-      }
-
-      // Guarda o desvio
       desvios[desvio.id] = desvio;
-      await saveBackup();
-
-      // Notifica
       await notificarDesvio(desvio);
 
     } catch (err) {
@@ -645,50 +557,38 @@ async function startUserbot() {
     }
   }, new NewMessage({}));
 
-  console.log(`[USERBOT] Monitorando grupo "${GROUP_NAME}"...`);
-
-  // Expõe função de sincronização retroativa
-  userbotClient = client;
-  userbotGroupId = targetGroupId;
+  console.log('[USERBOT] Monitorando...');
 }
 
 // ─── Startup ──────────────────────────────────────────────────────────────────
 (async () => {
   console.log('[BOT] Iniciando Desvios Bot...');
-  loadLocalState(); // carrega /tmp (rápido, pode estar vazio após restart)
+  loadLocalState();
 
   try {
-    await startUserbot(); // conecta userbot e expõe userbotClient
+    await startUserbot();
   } catch (err) {
-    console.error('[USERBOT] Falha ao iniciar:', err.message);
+    console.error('[USERBOT] Falha:', err.message);
   }
 
-  // Tenta restaurar estado do histórico do Telegram (sobrevive a restarts)
   if (userbotClient && Object.keys(desvios).length === 0) {
-    const restored = await restoreFromTelegram(userbotClient);
-    if (!restored) {
-      console.log('[BACKUP] Sem backup encontrado, iniciando do zero.');
-    }
+    await restoreFromTelegram(userbotClient).catch(() => {});
   }
 
-  // Aguarda 8s antes de iniciar polling — evita 409 Conflict no Railway
-  // (instância anterior precisa de tempo para encerrar)
+  // Delay para evitar 409 Conflict no Railway
   console.log('[BOT] Aguardando 8s antes de iniciar polling...');
   await new Promise(r => setTimeout(r, 8000));
   bot.startPolling({ restart: false });
   console.log('[BOT] Polling iniciado.');
 
-  try {
-    await bot.sendMessage(MY_CHAT_ID,
-      `🤖 *Desvios Bot iniciado!*\n` +
-      `📋 ${Object.keys(desvios).length} desvios carregados\n\n` +
-      `Monitorando: _${GROUP_NAME}_\n\n` +
-      `/desvios — lista completa\n` +
-      `/pendentes — aguardando tratativa\n` +
-      `/sincronizar 7 — importar PDFs antigos`,
-      { parse_mode: 'Markdown' });
-    console.log('[BOT] Pronto.');
-  } catch (err) {
-    console.error('[BOT] Erro na msg de startup:', err.message);
-  }
+  await bot.sendMessage(MY_CHAT_ID,
+    `🤖 *Desvios Bot iniciado!*\n` +
+    `📋 ${Object.keys(desvios).length} desvios carregados\n` +
+    `🔍 Monitorando: _${GROUP_NAME}_\n` +
+    `🤖 Parser: Claude Vision\n\n` +
+    `/desvios · /pendentes · /sincronizar 7\n` +
+    `DD/MM/AAAA — desvios por data`,
+    { parse_mode: 'Markdown' });
+
+  console.log('[BOT] Pronto.');
 })();
