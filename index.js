@@ -101,31 +101,41 @@ async function parseComClaude(buffer, mimeType) {
         },
         {
           type: 'text',
-          text: `Você está analisando uma imagem de um relatório chamado "DIÁRIO DE BORDO" de desvio operacional de uma empresa de transporte.
+          text: `Analise esta imagem de um relatório "DIÁRIO DE BORDO" de desvio operacional de empresa de transporte.
 
-Extraia os seguintes campos e retorne SOMENTE um JSON válido, sem markdown, sem texto extra:
+A tabela tem duas colunas principais: PERGUNTAS (esquerda) e RESPOSTA (direita).
+Extraia SEMPRE o valor da coluna RESPOSTA, nunca o texto da coluna PERGUNTAS.
+
+Retorne SOMENTE JSON válido, sem markdown:
 
 {
-  "id": "valor do campo Identificação no topo direito (formato DI-XXXX)",
-  "evento": "tipo do evento — item 1 da tabela",
-  "placa": "placa do veículo — item 2",
-  "motorista": "nome completo do motorista/ajudante — item 3",
-  "dataDesvio": "data do desvio em formato YYYY-MM-DD — item 4",
-  "horario": "horário do desvio em HH:MM — item 5",
-  "turno": "NOTURNO ou DIURNO — item 6",
-  "reincidente": "SIM ou NÃO — item 7",
-  "unidade": "nome da unidade — item 9",
-  "supervisor": "nome do supervisor — item 10",
-  "gravidade": "ALTA, MÉDIA ou BAIXA — item 13",
-  "descricao": "descrição do evento — item 15",
-  "analise": "análise completa — item 16",
-  "respondente": "nome do respondente no cabeçalho",
-  "dataResposta": "data de resposta no cabeçalho em DD/MM/YYYY HH:MM"
+  "id": "Identificação no canto superior direito — ex: DI-0001 (copie exatamente, incluindo todos os dígitos)",
+  "evento": "RESPOSTA do item 1 (ex: FADIGA, DISTRAÇÃO, SONOLÊNCIA — NÃO escreva 'EVENTO 1')",
+  "placa": "RESPOSTA do item 2 — placa exata como aparece (ex: 12118-THY9D46)",
+  "motorista": "RESPOSTA do item 3 — nome completo exato",
+  "dataDesvio": "RESPOSTA do item 4 — formato YYYY-MM-DD",
+  "horario": "RESPOSTA do item 5 — formato HH:MM",
+  "turno": "RESPOSTA do item 6 — NOTURNO ou DIURNO",
+  "reincidente": "RESPOSTA do item 7 — SIM ou NÃO",
+  "primeiraOcorrencia": "RESPOSTA do item 8 se visível, senão null",
+  "unidade": "RESPOSTA do item 9",
+  "supervisor": "RESPOSTA do item 10 — nome exato",
+  "descumpriuCartilha": "RESPOSTA do item 11 — SIM ou NÃO",
+  "evidenciaTratativa": "RESPOSTA do item 12",
+  "gravidade": "RESPOSTA do item 13 — LEVE, MÉDIA, ALTA, GRAVE, GRAVÍSSIMA ou CRÍTICA",
+  "observacao": "RESPOSTA do item 14",
+  "descricao": "RESPOSTA do item 15 — descrição do evento",
+  "analise": "RESPOSTA do item 16 — texto completo da análise, copiado fielmente",
+  "contatoRealizado": "RESPOSTA do item 21 se visível",
+  "respondente": "Respondente no cabeçalho",
+  "autor": "Autor no cabeçalho",
+  "dataResposta": "Data de Resposta no cabeçalho — ex: 11/05/2026, 15:54"
 }
 
-Se um campo não estiver visível na imagem, use null.
-Se a imagem NÃO for um relatório de Diário de Bordo, retorne: {"id":null,"motorista":null,"evento":null}
-Não invente valores. Retorne SOMENTE o JSON, sem texto adicional.`,
+IMPORTANTE:
+- Copie os textos exatamente como estão na imagem, sem corrigir ou resumir
+- Se um campo não estiver visível, use null
+- Se a imagem não for um Diário de Bordo, retorne: {"id":null,"motorista":null,"evento":null}`,
         },
       ],
     }],
@@ -182,28 +192,40 @@ function isRelatorioDesvio(campos) {
 
 // ─── Monta registro do desvio ─────────────────────────────────────────────────
 function montarDesvio(campos) {
-  const id = (campos.id && /DI-\d+/i.test(campos.id))
-    ? campos.id.toUpperCase()
+  const id = (campos.id && /DI-[\dA-Z]+/i.test(campos.id))
+    ? campos.id.toUpperCase().trim()
     : `DI-${Date.now().toString().slice(-6)}`;
+
+  // Se evento veio como "EVENTO 1" (cabeçalho da coluna), usa descrição como fallback
+  const eventoRaw = campos.evento || '';
+  const evento = /^EVENTO\s*\d*$/i.test(eventoRaw.trim())
+    ? (campos.descricao || '—')
+    : (eventoRaw || campos.descricao || '—');
 
   return {
     id,
-    evento:       campos.evento      || '—',
-    placa:        campos.placa       || '—',
-    motorista:    campos.motorista   || '—',
-    dataDesvio:   campos.dataDesvio  || '—',
-    horario:      campos.horario     || '—',
-    turno:        campos.turno       || '—',
-    reincidente:  campos.reincidente || '—',
-    unidade:      campos.unidade     || '—',
-    supervisor:   campos.supervisor  || '—',
-    gravidade:    campos.gravidade   || '—',
-    descricao:    campos.descricao   || '—',
-    analise:      campos.analise     || '—',
-    respondente:  campos.respondente || '—',
-    dataResposta: campos.dataResposta || '—',
-    status:       'PENDENTE',
-    criadoEm:     new Date().toISOString(),
+    evento,
+    placa:               campos.placa               || '—',
+    motorista:           campos.motorista            || '—',
+    dataDesvio:          campos.dataDesvio           || '—',
+    horario:             campos.horario              || '—',
+    turno:               campos.turno                || '—',
+    reincidente:         campos.reincidente          || '—',
+    primeiraOcorrencia:  campos.primeiraOcorrencia   || '—',
+    unidade:             campos.unidade              || '—',
+    supervisor:          campos.supervisor           || '—',
+    descumpriuCartilha:  campos.descumpriuCartilha   || '—',
+    evidenciaTratativa:  campos.evidenciaTratativa   || '—',
+    gravidade:           campos.gravidade            || '—',
+    observacao:          campos.observacao           || '—',
+    descricao:           campos.descricao            || '—',
+    analise:             campos.analise              || '—',
+    contatoRealizado:    campos.contatoRealizado      || '—',
+    respondente:         campos.respondente          || '—',
+    autor:               campos.autor                || '—',
+    dataResposta:        campos.dataResposta         || '—',
+    status:              'PENDENTE',
+    criadoEm:            new Date().toISOString(),
   };
 }
 
@@ -229,10 +251,11 @@ async function processarMidia(buffer, mimeType, origem) {
 
 // ─── Emojis ───────────────────────────────────────────────────────────────────
 function gravidadeEmoji(g) {
-  const l = (g || '').toLowerCase();
-  if (l.includes('alta') || l.includes('crítica')) return '🔴';
-  if (l.includes('média') || l.includes('media'))  return '🟡';
-  if (l.includes('baixa'))                         return '🟢';
+  const l = (g || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+  if (l.includes('gravissima') || l.includes('critica'))  return '🔴';
+  if (l.includes('grave') || l.includes('alta'))          return '🟠';
+  if (l.includes('media') || l.includes('moderada'))      return '🟡';
+  if (l.includes('leve') || l.includes('baixa'))          return '🟢';
   return '⚪';
 }
 function statusEmoji(s) {
@@ -247,38 +270,58 @@ function campo(label, val) {
 
 // ─── Formata resumo ───────────────────────────────────────────────────────────
 function formatResumo(d, completo = false) {
-  const gEmoji   = gravidadeEmoji(d.gravidade);
-  const reincAviso = (d.reincidente || '').toUpperCase() === 'SIM' ? '⚠️ *REINCIDENTE*\n' : '';
+  const gEmoji     = gravidadeEmoji(d.gravidade);
+  const reinc      = (d.reincidente || '').toUpperCase();
+  const reincAviso = reinc === 'SIM' ? '⚠️ *REINCIDENTE*\n' : '';
+
+  const dataHora = [
+    d.dataDesvio !== '—' ? d.dataDesvio : null,
+    d.horario    !== '—' ? `às ${d.horario}` : null,
+    d.turno      !== '—' ? `(${d.turno})` : null,
+  ].filter(Boolean).join(' ');
 
   let msg =
     `🚨 *Desvio ${d.id}* ${statusEmoji(d.status)}\n` +
     reincAviso + `\n` +
-    campo('👤 *Motorista:*', d.motorista) +
-    campo('🚛 *Placa:*', d.placa) +
-    campo(`📅 *Data/Hora:*`, d.dataDesvio && d.horario !== '—'
-      ? `${d.dataDesvio} às ${d.horario} (${d.turno})`
-      : d.dataDesvio || d.horario) +
-    campo('📍 *Unidade:*', d.unidade) +
+    campo('👤 *Motorista:*',  d.motorista) +
+    campo('🚛 *Placa:*',      d.placa) +
+    (dataHora ? `📅 *Data/Hora:* ${dataHora}\n` : '') +
+    campo('📍 *Unidade:*',    d.unidade) +
     campo('👔 *Supervisor:*', d.supervisor) +
     `\n` +
     campo('⚡ *Evento:*', d.evento) +
-    `${gEmoji} *Gravidade:* ${d.gravidade}\n`;
+    (d.gravidade !== '—' ? `${gEmoji} *Gravidade:* ${d.gravidade}\n` : '');
 
   if (d.descricao && d.descricao !== '—' && d.descricao !== d.evento) {
     msg += `\n📝 *Descrição:* ${d.descricao}\n`;
   }
 
-  if (completo && d.analise && d.analise !== '—') {
-    msg += `\n📊 *Análise:*\n${d.analise.slice(0, 600)}\n`;
+  if (completo) {
+    if (d.analise && d.analise !== '—') {
+      msg += `\n📊 *Análise:*\n${d.analise.slice(0, 700)}\n`;
+    }
+    if (d.observacao && d.observacao !== '—' && d.observacao !== 'N/A') {
+      msg += `\n💬 *Observação:* ${d.observacao}\n`;
+    }
+
+    // Campos de auditoria
+    const auditoria = [
+      d.descumpriuCartilha !== '—' ? `📋 Descumpriu cartilha: ${d.descumpriuCartilha}` : null,
+      d.evidenciaTratativa !== '—' ? `📎 Evidência tratativa: ${d.evidenciaTratativa}` : null,
+      d.contatoRealizado   !== '—' ? `📞 Contato realizado: ${d.contatoRealizado}` : null,
+    ].filter(Boolean);
+    if (auditoria.length) msg += `\n${auditoria.join('\n')}\n`;
+
     if (d.respondente && d.respondente !== '—') {
       msg += `\n📋 *Respondente:* ${d.respondente}\n`;
+      if (d.autor && d.autor !== '—') msg += `✍️ *Autor:* ${d.autor}\n`;
       msg += campo('🕐 *Data Resposta:*', d.dataResposta);
     }
   }
 
   msg += `\n─────────────────\n📌 *Status:* ${d.status}`;
 
-  if (d.status === 'PENDENTE') {
+  if (d.status === 'PENDENTE' && !completo) {
     msg += `\n\nDigite *sim* para iniciar tratativa ou *não* para ignorar.`;
   }
 
@@ -301,30 +344,38 @@ bot.on('message', async (msg) => {
 
   // ── /desvios ────────────────────────────────────────────────────────────────
   if (text === '/desvios') {
-    const list = Object.values(desvios);
+    const list = Object.values(desvios).sort((a, b) => (b.criadoEm || '').localeCompare(a.criadoEm || ''));
     if (list.length === 0) { await bot.sendMessage(MY_CHAT_ID, '✅ Nenhum desvio registrado.'); return; }
 
-    const grupos = {
-      PENDENTE:     list.filter(d => d.status === 'PENDENTE'),
-      EM_TRATATIVA: list.filter(d => d.status === 'EM_TRATATIVA'),
-      CONCLUIDO:    list.filter(d => d.status === 'CONCLUIDO'),
-    };
+    const pendentes   = list.filter(d => d.status === 'PENDENTE');
+    const tratativas  = list.filter(d => d.status === 'EM_TRATATIVA');
+    const concluidos  = list.filter(d => d.status === 'CONCLUIDO');
 
-    const linha = (d) => {
-      const data  = d.dataDesvio !== '—' ? d.dataDesvio : d.criadoEm?.slice(0,10);
-      const nome  = d.motorista  !== '—' ? d.motorista  : '(nome não identificado)';
-      const evt   = d.evento     !== '—' ? ` | ${d.evento}` : '';
-      const grav  = d.gravidade  !== '—' ? ` ${gravidadeEmoji(d.gravidade)}` : '';
-      return `  • \`${d.id}\`${grav} ${nome}${evt} | ${data}\n`;
-    };
+    // Cabeçalho resumido
+    await bot.sendMessage(MY_CHAT_ID,
+      `📋 *Desvios — ${list.length} total*\n` +
+      `🔴 Pendentes: ${pendentes.length} · 🟡 Em Tratativa: ${tratativas.length} · ✅ Concluídos: ${concluidos.length}`,
+      { parse_mode: 'Markdown' });
 
-    let msgOut = `📋 *Desvios — ${list.length} total*\n\n`;
-    if (grupos.PENDENTE.length)     { msgOut += `🔴 *Pendentes (${grupos.PENDENTE.length}):*\n`;     grupos.PENDENTE.forEach(d => { msgOut += linha(d); }); }
-    if (grupos.EM_TRATATIVA.length) { msgOut += `\n🟡 *Em Tratativa (${grupos.EM_TRATATIVA.length}):*\n`; grupos.EM_TRATATIVA.forEach(d => { msgOut += linha(d); }); }
-    if (grupos.CONCLUIDO.length)    { msgOut += `\n✅ *Concluídos (${grupos.CONCLUIDO.length}):*\n`; grupos.CONCLUIDO.slice(-5).forEach(d => { msgOut += linha(d); }); }
-    msgOut += `\n_Use /desvio DI-XXXX para detalhes_`;
+    // Envia card completo para cada pendente (até 10)
+    for (const d of pendentes.slice(0, 10)) {
+      await bot.sendMessage(MY_CHAT_ID, formatResumo(d, true), { parse_mode: 'Markdown' });
+    }
 
-    await bot.sendMessage(MY_CHAT_ID, msgOut, { parse_mode: 'Markdown' });
+    // Em tratativa: card sem análise
+    if (tratativas.length) {
+      for (const d of tratativas) {
+        await bot.sendMessage(MY_CHAT_ID, formatResumo(d, false), { parse_mode: 'Markdown' });
+      }
+    }
+
+    // Concluídos: só lista compacta
+    if (concluidos.length) {
+      const linhas = concluidos.slice(-5).map(d =>
+        `✅ \`${d.id}\` ${d.motorista !== '—' ? d.motorista : '—'} | ${d.dataDesvio}`
+      );
+      await bot.sendMessage(MY_CHAT_ID, `*Concluídos recentes:*\n${linhas.join('\n')}`, { parse_mode: 'Markdown' });
+    }
     return;
   }
 
