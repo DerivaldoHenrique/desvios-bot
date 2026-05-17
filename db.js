@@ -15,6 +15,16 @@ const pool = new Pool({
   connectionTimeoutMillis: 10000,
 });
 
+// Pool secundário — banco principal Ponto (cadastro_pessoas)
+const neonPool = process.env.NEON_DATABASE_URL
+  ? new Pool({
+      connectionString: process.env.NEON_DATABASE_URL,
+      ssl: { rejectUnauthorized: false },
+      max: 3,
+      connectionTimeoutMillis: 8000,
+    })
+  : null;
+
 // ─── Setup ────────────────────────────────────────────────────────────────────
 async function setupDb() {
   // Cria tabelas se não existirem (setup novo — PK já é telegram_msg_id)
@@ -88,6 +98,11 @@ async function setupDb() {
     END $$;
   `);
 
+  // Adiciona coluna matricula se não existir (migration incremental)
+  await pool.query(`
+    ALTER TABLE desvios ADD COLUMN IF NOT EXISTS matricula VARCHAR(30);
+  `);
+
   console.log('[DB] Tabelas OK');
 }
 
@@ -122,17 +137,17 @@ async function saveDesvio(d, telegramMsgId) {
 
   await pool.query(
     `INSERT INTO desvios (
-      telegram_msg_id, id, evento, placa, motorista, data_desvio, horario, turno,
+      telegram_msg_id, id, evento, placa, motorista, matricula, data_desvio, horario, turno,
       reincidente, primeira_ocorrencia, unidade, supervisor, descumpriu_cartilha,
       evidencia_tratativa, gravidade, observacao, descricao, analise,
       contato_realizado, respondente, autor, data_resposta, status, atualizado_em
     ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,NOW()
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,NOW()
     )
     ON CONFLICT (telegram_msg_id) DO UPDATE SET
       id = EXCLUDED.id, evento = EXCLUDED.evento, placa = EXCLUDED.placa,
-      motorista = EXCLUDED.motorista, data_desvio = EXCLUDED.data_desvio,
-      horario = EXCLUDED.horario, turno = EXCLUDED.turno,
+      motorista = EXCLUDED.motorista, matricula = EXCLUDED.matricula,
+      data_desvio = EXCLUDED.data_desvio, horario = EXCLUDED.horario, turno = EXCLUDED.turno,
       reincidente = EXCLUDED.reincidente, unidade = EXCLUDED.unidade,
       supervisor = EXCLUDED.supervisor, gravidade = EXCLUDED.gravidade,
       descricao = EXCLUDED.descricao, analise = EXCLUDED.analise,
@@ -140,7 +155,8 @@ async function saveDesvio(d, telegramMsgId) {
       atualizado_em = NOW()`,
     [
       telegramMsgId,
-      d.id, d.evento, d.placa, d.motorista, d.dataDesvio, d.horario, d.turno,
+      d.id, d.evento, d.placa, d.motorista, d.matricula || null,
+      d.dataDesvio, d.horario, d.turno,
       d.reincidente, d.primeiraOcorrencia, d.unidade, d.supervisor, d.descumpriuCartilha,
       d.evidenciaTratativa, d.gravidade, d.observacao, d.descricao, d.analise,
       d.contatoRealizado, d.respondente, d.autor, d.dataResposta, d.status,
@@ -184,9 +200,54 @@ async function loadAllDesvios() {
     respondente:        row.respondente         || '—',
     autor:              row.autor               || '—',
     dataResposta:       row.data_resposta       || '—',
+    matricula:          row.matricula           || '—',
     status:             row.status              || 'PENDENTE',
     criadoEm:           row.criado_em?.toISOString() || new Date().toISOString(),
   }));
+}
+
+// ─── Colaboradores (banco principal Ponto/Neon) ───────────────────────────────
+
+async function buscarColaborador(nome) {
+  if (!neonPool) return null;
+  if (!nome || nome === '—' || nome.length < 4) return null;
+
+  try {
+    // Tenta com pg_trgm similarity (melhor resultado)
+    let r = await neonPool.query(`
+      SELECT nome, documento
+      FROM cadastro_pessoas
+      WHERE similarity(lower(nome), lower($1)) > 0.35
+      ORDER BY similarity(lower(nome), lower($1)) DESC
+      LIMIT 1
+    `, [nome]).catch(() => null);
+
+    if (r?.rowCount > 0) {
+      console.log(`[CADASTRO] Match (trgm): "${nome}" → "${r.rows[0].nome}"`);
+      return r.rows[0];
+    }
+
+    // Fallback: busca pelas 2 primeiras palavras do nome (ignora erros do OCR no resto)
+    const palavras = nome.trim().split(/\s+/).filter(p => p.length > 3).slice(0, 2);
+    if (palavras.length === 0) return null;
+
+    r = await neonPool.query(
+      `SELECT nome, documento FROM cadastro_pessoas
+       WHERE ${palavras.map((_, i) => `lower(nome) LIKE lower($${i+1})`).join(' AND ')}
+       LIMIT 1`,
+      palavras.map(p => `%${p}%`)
+    );
+
+    if (r.rowCount > 0) {
+      console.log(`[CADASTRO] Match (LIKE): "${nome}" → "${r.rows[0].nome}"`);
+      return r.rows[0];
+    }
+
+    return null;
+  } catch (err) {
+    console.error('[CADASTRO] Erro:', err.message);
+    return null;
+  }
 }
 
 module.exports = {
@@ -198,4 +259,5 @@ module.exports = {
   updateDesvioStatus,
   clearAllDesvios,
   loadAllDesvios,
+  buscarColaborador,
 };

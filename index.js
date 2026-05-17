@@ -9,14 +9,16 @@ const fs                 = require('fs');
 const db                 = require('./db');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
-const API_ID        = parseInt(process.env.TELEGRAM_API_ID);
-const API_HASH      = process.env.TELEGRAM_API_HASH;
-const SESSION_STR   = process.env.TELEGRAM_SESSION || '';
-const GROUP_NAME    = process.env.TELEGRAM_GROUP_NAME || 'OPERAÇÃO QSEMST - ES - BNL';
-const SENDER_ID     = process.env.TELEGRAM_SENDER_ID ? parseInt(process.env.TELEGRAM_SENDER_ID) : null;
-const BOT_TOKEN     = process.env.DESVIOS_BOT_TOKEN;
-const MY_CHAT_ID    = process.env.TELEGRAM_MY_CHAT_ID;
+const API_ID             = parseInt(process.env.TELEGRAM_API_ID);
+const API_HASH           = process.env.TELEGRAM_API_HASH;
+const SESSION_STR        = process.env.TELEGRAM_SESSION || '';
+const GROUP_NAME         = process.env.TELEGRAM_GROUP_NAME || 'OPERAÇÃO QSEMST - ES - BNL';
+const SENDER_ID          = process.env.TELEGRAM_SENDER_ID ? parseInt(process.env.TELEGRAM_SENDER_ID) : null;
+const BOT_TOKEN          = process.env.DESVIOS_BOT_TOKEN;
+const MY_CHAT_ID         = process.env.TELEGRAM_MY_CHAT_ID;
+const GOOGLE_VISION_KEY  = process.env.GOOGLE_VISION_API_KEY;
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const axios     = require('axios');
 
 // ─── State (em memória, fonte da verdade = PostgreSQL) ────────────────────────
 // Chave = telegramMsgId (string) — único por mensagem, sem colisões de ID DI-XXXX
@@ -41,80 +43,66 @@ async function persistirDesvio(desvio, telegramMsgId) {
 // ─── Bot ──────────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// ─── Claude Vision: extrai campos do relatório ────────────────────────────────
-async function parseComClaude(buffer, mimeType) {
-  const base64    = buffer.toString('base64');
-  const mediaType = (mimeType && mimeType.startsWith('image/')) ? mimeType : 'image/jpeg';
+// ─── Google Vision OCR + Claude parse (só texto — mais barato e preciso) ──────
+async function parseComGoogleVision(buffer) {
+  if (!GOOGLE_VISION_KEY) throw new Error('GOOGLE_VISION_API_KEY não configurada');
 
-  const response = await anthropic.messages.create({
+  // Passo 1: OCR preciso com Google Vision DOCUMENT_TEXT_DETECTION
+  const ocrResp = await axios.post(
+    `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_KEY}`,
+    {
+      requests: [{
+        image: { content: buffer.toString('base64') },
+        features: [{ type: 'DOCUMENT_TEXT_DETECTION', maxResults: 1 }],
+        imageContext: { languageHints: ['pt-BR'] },
+      }],
+    },
+    { timeout: 30000 }
+  );
+
+  const ocrResult = ocrResp.data.responses?.[0];
+  if (ocrResult?.error) throw new Error(`Google Vision: ${ocrResult.error.message}`);
+
+  const ocrText = ocrResult?.fullTextAnnotation?.text || '';
+  if (ocrText.trim().length < 30) {
+    console.log('[VISION] Texto muito curto, ignorando.');
+    throw new Error('NÃO_RELATORIO');
+  }
+  console.log(`[VISION] OCR: ${ocrText.length} chars`);
+
+  // Passo 2: Claude extrai campos estruturados do texto OCR (sem imagem = muito mais barato)
+  const parseResp = await anthropic.messages.create({
     model: 'claude-haiku-4-5-20251001',
-    max_tokens: 2048,
+    max_tokens: 1024,
     messages: [{
       role: 'user',
-      content: [
-        {
-          type: 'image',
-          source: { type: 'base64', media_type: mediaType, data: base64 },
-        },
-        {
-          type: 'text',
-          text: `Analise esta imagem de um relatório "DIÁRIO DE BORDO" de desvio operacional de empresa de transporte.
+      content: `Texto extraído via OCR de um formulário "DIÁRIO DE BORDO" de desvio operacional.
+O formulário é uma tabela numerada: cada item tem um número (1-25), uma PERGUNTA e uma RESPOSTA.
+O cabeçalho tem: Identificação (ID tipo DI-XXXX), Autor, Respondente, Data de Resposta.
 
-A tabela tem duas colunas: PERGUNTAS (coluna esquerda, fundo escuro) e RESPOSTA (coluna direita, fundo claro).
-Leia SOMENTE a coluna RESPOSTA. Nunca copie texto da coluna PERGUNTAS.
+VALORES FIXOS desta empresa (substitua se o OCR errou):
+- Item 9 Unidade = "SEACREST ES"
+- Item 10 Supervisor = "DERIVALDO"
 
-VALORES DE REFERÊNCIA conhecidos desta empresa (use para corrigir leituras próximas):
-- Unidade: "SEACREST ES" (não SEACHERS, SEACRES, SEACRESTS, etc.)
-- Supervisor: "DERIVALDO" (não DERRIVALDO, DERIVADOR, DERRIVAL, etc.)
-- Turno: "NOTURNO" ou "DIURNO"
-- Reincidente: "SIM" ou "NÃO"
+Retorne SOMENTE JSON sem markdown:
+{"id":"DI-XXXX","evento":"item1","placa":"item2","motorista":"item3","dataDesvio":"YYYY-MM-DD","horario":"HH:MM","turno":"NOTURNO|DIURNO","reincidente":"SIM|NÃO","primeiraOcorrencia":"item8","unidade":"item9","supervisor":"item10","descumpriuCartilha":"SIM|NÃO","evidenciaTratativa":"item12","gravidade":"LEVE|MÉDIA|ALTA|GRAVE|GRAVÍSSIMA|CRÍTICA","observacao":"item14","descricao":"item15","analise":"item16 completo","contatoRealizado":"SIM|NÃO","respondente":"cabeçalho","autor":"cabeçalho","dataResposta":"cabeçalho"}
 
-Retorne SOMENTE JSON válido, sem markdown, sem comentários:
+Se não for Diário de Bordo: {"id":null,"motorista":null,"evento":null}
 
-{
-  "id": "string no canto superior direito após 'Identificação:' — ex: DI-0001 — copie todos os dígitos",
-  "evento": "RESPOSTA do item 1 — tipo do desvio (ex: FADIGA, DISTRAÇÃO, SONOLÊNCIA, AJUDANTE DORMINDO)",
-  "placa": "RESPOSTA do item 2 — placa exata (ex: 12118-THY9D46)",
-  "motorista": "RESPOSTA do item 3 — nome completo do motorista ou ajudante",
-  "dataDesvio": "RESPOSTA do item 4 — formato YYYY-MM-DD",
-  "horario": "RESPOSTA do item 5 — formato HH:MM",
-  "turno": "RESPOSTA do item 6 — NOTURNO ou DIURNO",
-  "reincidente": "RESPOSTA do item 7 — SIM ou NÃO",
-  "primeiraOcorrencia": "RESPOSTA do item 8 se visível, senão null",
-  "unidade": "RESPOSTA do item 9 — use valor de referência se próximo",
-  "supervisor": "RESPOSTA do item 10 — use valor de referência se próximo",
-  "descumpriuCartilha": "RESPOSTA do item 11 — SIM ou NÃO",
-  "evidenciaTratativa": "RESPOSTA do item 12",
-  "gravidade": "RESPOSTA do item 13 — LEVE, MÉDIA, ALTA, GRAVE, GRAVÍSSIMA ou CRÍTICA",
-  "observacao": "RESPOSTA do item 14 — texto completo",
-  "descricao": "RESPOSTA do item 15 — descrição do evento, texto completo",
-  "analise": "RESPOSTA do item 16 — análise completa, copie fielmente sem resumir",
-  "contatoRealizado": "RESPOSTA do item 21 se visível — SIM ou NÃO",
-  "respondente": "valor do campo Respondente no cabeçalho",
-  "autor": "valor do campo Autor no cabeçalho",
-  "dataResposta": "valor do campo Data de Resposta no cabeçalho — ex: 11/05/2026, 15:54"
-}
-
-REGRAS:
-- Leia caractere por caractere o nome do motorista — não invente nem complete
-- Se a imagem não for um Diário de Bordo, retorne: {"id":null,"motorista":null,"evento":null}
-- Campos não visíveis: use null`,
-        },
-      ],
+TEXTO OCR:
+${ocrText.slice(0, 4000)}`,
     }],
   });
 
-  const text = response.content[0].text.trim();
-  // Remove possíveis blocos markdown
-  const clean = text.replace(/^```json?\n?/, '').replace(/\n?```$/, '').trim();
+  const raw = parseResp.content[0].text.trim()
+    .replace(/^```json?\n?/, '').replace(/\n?```$/, '').trim();
 
-  // Se Claude não retornou JSON (ex: "Não é um relatório de desvio")
-  if (!clean.startsWith('{')) {
-    console.log('[CLAUDE] Resposta não-JSON:', clean.slice(0, 80));
+  if (!raw.startsWith('{')) {
+    console.log('[PARSE] Não-JSON:', raw.slice(0, 80));
     throw new Error('NÃO_RELATORIO');
   }
 
-  return JSON.parse(clean);
+  return JSON.parse(raw);
 }
 
 // ─── Parse PDF com pdf-parse ──────────────────────────────────────────────────
@@ -268,6 +256,7 @@ function montarDesvio(campos) {
     respondente:         campos.respondente          || '—',
     autor:               campos.autor                || '—',
     dataResposta:        campos.dataResposta         || '—',
+    matricula:           '—',
     status:              'PENDENTE',
     criadoEm:            new Date().toISOString(),
   };
@@ -281,8 +270,8 @@ async function processarMidia(buffer, mimeType, origem) {
   if (isPdf) {
     campos = await parseComPdfParse(buffer);
   } else {
-    // Imagem → Claude Vision
-    campos = await parseComClaude(buffer, mimeType);
+    // Imagem → Google Vision OCR + Claude texto
+    campos = await parseComGoogleVision(buffer);
   }
 
   if (!isRelatorioDesvio(campos)) {
@@ -290,7 +279,23 @@ async function processarMidia(buffer, mimeType, origem) {
     return null;
   }
 
-  return montarDesvio(normalizarCampos(campos));
+  const desvio = montarDesvio(normalizarCampos(campos));
+
+  // Enriquece com dados do cadastro: corrige nome e traz matrícula
+  try {
+    const colab = await db.buscarColaborador(desvio.motorista);
+    if (colab) {
+      if (colab.nome) {
+        console.log(`[CADASTRO] Nome corrigido: "${desvio.motorista}" → "${colab.nome}"`);
+        desvio.motorista = colab.nome;
+      }
+      desvio.matricula = colab.documento || '—';
+    }
+  } catch (err) {
+    console.error('[CADASTRO] Erro na busca:', err.message);
+  }
+
+  return desvio;
 }
 
 // ─── Emojis ───────────────────────────────────────────────────────────────────
@@ -328,6 +333,7 @@ function formatResumo(d, completo = false) {
     `🚨 *Desvio ${d.id}* ${statusEmoji(d.status)}\n` +
     reincAviso + `\n` +
     campo('👤 *Motorista:*',  d.motorista) +
+    campo('🪪 *Matrícula:*',  d.matricula) +
     campo('🚛 *Placa:*',      d.placa) +
     (dataHora ? `📅 *Data/Hora:* ${dataHora}\n` : '') +
     campo('📍 *Unidade:*',    d.unidade) +
@@ -400,8 +406,8 @@ bot.on('message', async (msg) => {
       `🔴 Pendentes: ${pendentes.length} · 🟡 Em Tratativa: ${tratativas.length} · ✅ Concluídos: ${concluidos.length}`,
       { parse_mode: 'Markdown' });
 
-    // Envia card completo para cada pendente (até 10)
-    for (const d of pendentes.slice(0, 10)) {
+    // Envia card completo para cada pendente (até 30)
+    for (const d of pendentes.slice(0, 30)) {
       await bot.sendMessage(MY_CHAT_ID, formatResumo(d, true), { parse_mode: 'Markdown' });
     }
 
