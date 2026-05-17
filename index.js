@@ -123,7 +123,9 @@ Extraia os seguintes campos e retorne SOMENTE um JSON válido, sem markdown, sem
   "dataResposta": "data de resposta no cabeçalho em DD/MM/YYYY HH:MM"
 }
 
-Se um campo não estiver visível, use null. Não invente valores.`,
+Se um campo não estiver visível na imagem, use null.
+Se a imagem NÃO for um relatório de Diário de Bordo, retorne: {"id":null,"motorista":null,"evento":null}
+Não invente valores. Retorne SOMENTE o JSON, sem texto adicional.`,
         },
       ],
     }],
@@ -131,7 +133,14 @@ Se um campo não estiver visível, use null. Não invente valores.`,
 
   const text = response.content[0].text.trim();
   // Remove possíveis blocos markdown
-  const clean = text.replace(/^```json?\n?/, '').replace(/\n?```$/, '');
+  const clean = text.replace(/^```json?\n?/, '').replace(/\n?```$/, '').trim();
+
+  // Se Claude não retornou JSON (ex: "Não é um relatório de desvio")
+  if (!clean.startsWith('{')) {
+    console.log('[CLAUDE] Resposta não-JSON:', clean.slice(0, 80));
+    throw new Error('NÃO_RELATORIO');
+  }
+
   return JSON.parse(clean);
 }
 
