@@ -1,10 +1,19 @@
 const { Pool } = require('pg');
 
+const connStr = process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL;
+
+if (!connStr) {
+  console.error('[DB] ERRO: DATABASE_URL não configurada! Adicione no Railway Variables.');
+  process.exit(1);
+}
+
+// SSL necessário para conexão externa (proxy público), desnecessário na rede interna
+const useSSL = !connStr.includes('railway.internal');
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || process.env.DATABASE_PUBLIC_URL,
-  ssl: process.env.DATABASE_URL?.includes('railway.internal')
-    ? false
-    : { rejectUnauthorized: false },
+  connectionString: connStr,
+  ssl: useSSL ? { rejectUnauthorized: false } : false,
+  connectionTimeoutMillis: 10000,
 });
 
 // ─── Setup ────────────────────────────────────────────────────────────────────
