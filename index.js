@@ -6,6 +6,7 @@ const TelegramBot        = require('node-telegram-bot-api');
 const Anthropic          = require('@anthropic-ai/sdk');
 const pdfParse           = require('pdf-parse');
 const fs                 = require('fs');
+const db                 = require('./db');
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 const API_ID        = parseInt(process.env.TELEGRAM_API_ID);
@@ -15,70 +16,23 @@ const GROUP_NAME    = process.env.TELEGRAM_GROUP_NAME || 'OPERAÇÃO QSEMST - ES
 const SENDER_ID     = process.env.TELEGRAM_SENDER_ID ? parseInt(process.env.TELEGRAM_SENDER_ID) : null;
 const BOT_TOKEN     = process.env.DESVIOS_BOT_TOKEN;
 const MY_CHAT_ID    = process.env.TELEGRAM_MY_CHAT_ID;
-const STATE_FILE    = '/tmp/desvios-state.json';
-const BACKUP_ID_FILE = '/tmp/desvios-backup-id.txt';
-
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// ─── State ────────────────────────────────────────────────────────────────────
-let desvios     = {};
-let pendingAcao = null;
-let backupMsgId = null;
+// ─── State (em memória, fonte da verdade = PostgreSQL) ────────────────────────
+let desvios     = {};   // { [id]: DesvioRecord }
+let pendingAcao = null; // { desvioId, aguardando: 'confirmacao' }
 
-function loadLocalState() {
-  try {
-    const raw = JSON.parse(fs.readFileSync(STATE_FILE, 'utf8'));
-    desvios     = raw.desvios     || {};
-    pendingAcao = raw.pendingAcao || null;
-    console.log(`[STATE] ${Object.keys(desvios).length} desvios carregados do /tmp`);
-  } catch (_) {}
-  try { backupMsgId = parseInt(fs.readFileSync(BACKUP_ID_FILE, 'utf8').trim()); } catch (_) {}
+async function reloadDesvios() {
+  const rows = await db.loadAllDesvios();
+  desvios = {};
+  for (const d of rows) desvios[d.id] = d;
+  console.log(`[DB] ${rows.length} desvios carregados`);
 }
 
-function saveLocalState() {
-  try { fs.writeFileSync(STATE_FILE, JSON.stringify({ desvios, pendingAcao })); } catch (_) {}
-}
-
-async function restoreFromTelegram(client) {
-  try {
-    const messages = await client.getMessages(parseInt(MY_CHAT_ID), { limit: 80 });
-    for (const m of messages) {
-      const txt = m.message || '';
-      if (txt.includes('[BACKUP ESTADO]')) {
-        const jsonMatch = txt.match(/\{[\s\S]+\}/);
-        if (jsonMatch) {
-          const parsed = JSON.parse(jsonMatch[0]);
-          desvios     = parsed.desvios     || {};
-          pendingAcao = parsed.pendingAcao || null;
-          backupMsgId = m.id;
-          fs.writeFileSync(BACKUP_ID_FILE, String(m.id));
-          saveLocalState();
-          console.log(`[BACKUP] Restaurado: ${Object.keys(desvios).length} desvios`);
-          return true;
-        }
-      }
-    }
-  } catch (err) {
-    console.error('[BACKUP] Erro ao restaurar:', err.message);
-  }
-  return false;
-}
-
-async function saveBackup() {
-  saveLocalState();
-  try {
-    const payload = JSON.stringify({ desvios, pendingAcao });
-    const text = `📦 [BACKUP ESTADO]\n${payload}`;
-    if (backupMsgId) {
-      await bot.editMessageText(text, { chat_id: MY_CHAT_ID, message_id: backupMsgId });
-    } else {
-      const sent = await bot.sendMessage(MY_CHAT_ID, text);
-      backupMsgId = sent.message_id;
-      fs.writeFileSync(BACKUP_ID_FILE, String(backupMsgId));
-    }
-  } catch (err) {
-    console.error('[BACKUP] Erro ao salvar:', err.message);
-  }
+async function persistirDesvio(desvio, telegramMsgId = null) {
+  desvios[desvio.id] = desvio;
+  await db.saveDesvio(desvio, telegramMsgId);
+  if (telegramMsgId) await db.markMsgProcessed(telegramMsgId, true, desvio.id);
 }
 
 // ─── Bot ──────────────────────────────────────────────────────────────────────
@@ -331,7 +285,6 @@ function formatResumo(d, completo = false) {
 // ─── Notifica novo desvio ─────────────────────────────────────────────────────
 async function notificarDesvio(desvio) {
   pendingAcao = { desvioId: desvio.id, aguardando: 'confirmacao' };
-  await saveBackup();
   await bot.sendMessage(MY_CHAT_ID, formatResumo(desvio), { parse_mode: 'Markdown' });
   console.log(`[BOT] Desvio ${desvio.id} notificado — ${desvio.motorista}`);
 }
@@ -446,18 +399,19 @@ bot.on('message', async (msg) => {
     const d     = desvios[id];
 
     if (lower === 'sim' || lower === 's') {
-      if (d) { d.status = 'EM_TRATATIVA'; await saveBackup(); }
+      if (d) {
+        d.status = 'EM_TRATATIVA';
+        await db.updateDesvioStatus(id, 'EM_TRATATIVA');
+      }
       await bot.sendMessage(MY_CHAT_ID,
         `✅ Desvio \`${id}\` → *EM TRATATIVA*\n📧 Em breve: envio automático de e-mail.`,
         { parse_mode: 'Markdown' });
       pendingAcao = null;
-      await saveBackup();
       return;
     }
     if (lower === 'não' || lower === 'nao' || lower === 'n') {
       await bot.sendMessage(MY_CHAT_ID, `⏭ \`${id}\` mantido como PENDENTE.`, { parse_mode: 'Markdown' });
       pendingAcao = null;
-      await saveBackup();
       return;
     }
   }
@@ -487,9 +441,9 @@ async function sincronizarGrupo(dias = 7) {
   }
 
   const limitTs = Math.floor((Date.now() - dias * 86400000) / 1000);
-  let novos = 0, ignorados = 0, erros = 0;
+  let novos = 0, ignorados = 0, jaVisto = 0, erros = 0;
 
-  const messages = await userbotClient.getMessages(userbotGroupId, { limit: 300 });
+  const messages = await userbotClient.getMessages(userbotGroupId, { limit: 400 });
   const candidatos = messages.filter(m => {
     if (m.date < limitTs) return false;
     if (SENDER_ID && Number(m.senderId) !== SENDER_ID) return false;
@@ -499,27 +453,38 @@ async function sincronizarGrupo(dias = 7) {
   console.log(`[SINC] ${candidatos.length} mensagens com mídia do sender no período`);
 
   for (const m of candidatos) {
-    const hasPhoto = !!m.media?.photo;
-    const doc      = m.media?.document;
-    let mimeType   = 'image/jpeg';
+    // ── SKIP se já processado (economiza download + Claude) ──────────────────
+    if (await db.isMsgProcessed(m.id)) { jaVisto++; continue; }
+
+    const doc    = m.media?.document;
+    let mimeType = 'image/jpeg';
 
     if (doc) {
       mimeType = doc.mimeType || '';
       const fn = doc.attributes?.find(a => a.fileName)?.fileName || '';
       const isPdf = mimeType === 'application/pdf' || fn.toLowerCase().endsWith('.pdf');
       const isImg = mimeType.startsWith('image/');
-      if (!isPdf && !isImg) { console.log(`[SINC] Ignorando ${mimeType}`); continue; }
+      if (!isPdf && !isImg) {
+        // Marca como processado para nunca mais verificar (é vídeo, etc.)
+        await db.markMsgProcessed(m.id, false);
+        continue;
+      }
     }
 
     try {
       const buffer = await userbotClient.downloadMedia(m, {});
-      if (!buffer || buffer.length === 0) continue;
+      if (!buffer || buffer.length === 0) { await db.markMsgProcessed(m.id, false); continue; }
 
       const desvio = await processarMidia(buffer, mimeType, 'SINC');
-      if (!desvio) { ignorados++; continue; }
-      if (desvios[desvio.id]) { ignorados++; continue; }
 
-      desvios[desvio.id] = desvio;
+      if (!desvio) {
+        // Não é relatório — marca para nunca mais chamar Claude nessa imagem
+        await db.markMsgProcessed(m.id, false);
+        ignorados++;
+        continue;
+      }
+
+      await persistirDesvio(desvio, m.id);
       novos++;
       console.log(`[SINC] Importado: ${desvio.id} — ${desvio.motorista}`);
     } catch (err) {
@@ -527,11 +492,10 @@ async function sincronizarGrupo(dias = 7) {
       erros++;
     }
   }
-
-  await saveBackup();
+  await reloadDesvios();
   await bot.sendMessage(MY_CHAT_ID,
     `✅ *Sincronização concluída!*\n` +
-    `📥 ${novos} novo(s) | ⏭ ${ignorados} ignorado(s) | ❌ ${erros} erro(s)\n\n` +
+    `📥 ${novos} novo(s) | ⏭ ${jaVisto} já vistos (sem custo) | 🚫 ${ignorados} ignorados | ❌ ${erros} erro(s)\n\n` +
     (novos > 0 ? `Use /desvios para ver.` : `Nenhum relatório novo encontrado.`),
     { parse_mode: 'Markdown' });
 }
@@ -601,15 +565,20 @@ async function startUserbot() {
       const buffer = await client.downloadMedia(message, {});
       if (!buffer || buffer.length === 0) return;
 
-      const desvio = await processarMidia(buffer, mimeType, 'USERBOT');
-      if (!desvio) return;
-
-      if (desvios[desvio.id]) {
-        console.log(`[USERBOT] Desvio ${desvio.id} já existe, ignorando.`);
+      // Skip se já processado
+      if (await db.isMsgProcessed(message.id)) {
+        console.log(`[USERBOT] Msg ${message.id} já processada, ignorando.`);
         return;
       }
 
-      desvios[desvio.id] = desvio;
+      const desvio = await processarMidia(buffer, mimeType, 'USERBOT');
+
+      if (!desvio) {
+        await db.markMsgProcessed(message.id, false);
+        return;
+      }
+
+      await persistirDesvio(desvio, message.id);
       await notificarDesvio(desvio);
 
     } catch (err) {
@@ -623,16 +592,15 @@ async function startUserbot() {
 // ─── Startup ──────────────────────────────────────────────────────────────────
 (async () => {
   console.log('[BOT] Iniciando Desvios Bot...');
-  loadLocalState();
+
+  // Banco de dados
+  await db.setupDb();
+  await reloadDesvios();
 
   try {
     await startUserbot();
   } catch (err) {
     console.error('[USERBOT] Falha:', err.message);
-  }
-
-  if (userbotClient && Object.keys(desvios).length === 0) {
-    await restoreFromTelegram(userbotClient).catch(() => {});
   }
 
   // Delay para evitar 409 Conflict no Railway
