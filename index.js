@@ -43,22 +43,41 @@ async function persistirDesvio(desvio, telegramMsgId) {
 // ─── Bot ──────────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
+// Flag desabilitada automaticamente após primeiro 403
+let googleVisionEnabled = !!GOOGLE_VISION_KEY;
+
 // ─── Google Vision OCR + Claude parse (só texto — mais barato e preciso) ──────
 async function parseComGoogleVision(buffer) {
-  if (!GOOGLE_VISION_KEY) throw new Error('GOOGLE_VISION_API_KEY não configurada');
+  if (!GOOGLE_VISION_KEY || !googleVisionEnabled) throw new Error('VISION_DISABLED');
 
-  // Passo 1: OCR preciso com Google Vision DOCUMENT_TEXT_DETECTION
-  const ocrResp = await axios.post(
-    `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_KEY}`,
-    {
-      requests: [{
-        image: { content: buffer.toString('base64') },
-        features: [{ type: 'DOCUMENT_TEXT_DETECTION', maxResults: 1 }],
-        imageContext: { languageHints: ['pt-BR'] },
-      }],
-    },
-    { timeout: 30000 }
-  );
+  let ocrResp;
+  try {
+    // Passo 1: OCR preciso com Google Vision DOCUMENT_TEXT_DETECTION
+    ocrResp = await axios.post(
+      `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_KEY}`,
+      {
+        requests: [{
+          image: { content: buffer.toString('base64') },
+          features: [{ type: 'DOCUMENT_TEXT_DETECTION', maxResults: 1 }],
+          imageContext: { languageHints: ['pt-BR'] },
+        }],
+      },
+      { timeout: 30000 }
+    );
+  } catch (err) {
+    const status = err.response?.status;
+    if (status === 403 || status === 401) {
+      googleVisionEnabled = false;
+      console.error(`[VISION] HTTP ${status} — API não habilitada ou key inválida. Desabilitando Google Vision.`);
+      bot.sendMessage(MY_CHAT_ID,
+        `⚠️ Google Vision API retornou HTTP ${status}.\n` +
+        `Ative a Cloud Vision API em: console.cloud.google.com/apis/library/vision.googleapis.com\n` +
+        `Usando Claude Vision como fallback.`
+      ).catch(() => {});
+      throw new Error('VISION_AUTH_ERROR');
+    }
+    throw err;
+  }
 
   const ocrResult = ocrResp.data.responses?.[0];
   if (ocrResult?.error) throw new Error(`Google Vision: ${ocrResult.error.message}`);
@@ -103,6 +122,39 @@ ${ocrText.slice(0, 4000)}`,
   }
 
   return JSON.parse(raw);
+}
+
+// ─── Claude Vision (fallback quando Google Vision não disponível) ─────────────
+async function parseComClaude(buffer, mimeType) {
+  const base64    = buffer.toString('base64');
+  const mediaType = (mimeType && mimeType.startsWith('image/')) ? mimeType : 'image/jpeg';
+
+  const response = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 2048,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image', source: { type: 'base64', media_type: mediaType, data: base64 } },
+        {
+          type: 'text',
+          text: `Relatório "DIÁRIO DE BORDO" de desvio operacional. Tabela com PERGUNTAS (esquerda) e RESPOSTA (direita).
+Leia SOMENTE a coluna RESPOSTA.
+
+VALORES FIXOS: Unidade="SEACREST ES" | Supervisor="DERIVALDO"
+
+Retorne SOMENTE JSON sem markdown:
+{"id":"DI-XXXX","evento":"item1","placa":"item2","motorista":"item3","dataDesvio":"YYYY-MM-DD","horario":"HH:MM","turno":"NOTURNO|DIURNO","reincidente":"SIM|NÃO","primeiraOcorrencia":"item8","unidade":"item9","supervisor":"item10","descumpriuCartilha":"SIM|NÃO","evidenciaTratativa":"item12","gravidade":"LEVE|MÉDIA|ALTA|GRAVE|GRAVÍSSIMA|CRÍTICA","observacao":"item14","descricao":"item15","analise":"item16","contatoRealizado":"SIM|NÃO","respondente":"cabeçalho","autor":"cabeçalho","dataResposta":"cabeçalho"}
+Se não for Diário de Bordo: {"id":null,"motorista":null,"evento":null}`,
+        },
+      ],
+    }],
+  });
+
+  const clean = response.content[0].text.trim()
+    .replace(/^```json?\n?/, '').replace(/\n?```$/, '').trim();
+  if (!clean.startsWith('{')) throw new Error('NÃO_RELATORIO');
+  return JSON.parse(clean);
 }
 
 // ─── Parse PDF com pdf-parse ──────────────────────────────────────────────────
@@ -269,9 +321,21 @@ async function processarMidia(buffer, mimeType, origem) {
 
   if (isPdf) {
     campos = await parseComPdfParse(buffer);
+  } else if (googleVisionEnabled) {
+    // Tenta Google Vision OCR → Claude texto (mais barato e preciso)
+    try {
+      campos = await parseComGoogleVision(buffer);
+    } catch (err) {
+      if (err.message === 'VISION_AUTH_ERROR' || err.message === 'VISION_DISABLED') {
+        console.warn('[PARSE] Fallback para Claude Vision...');
+        campos = await parseComClaude(buffer, mimeType);
+      } else {
+        throw err;
+      }
+    }
   } else {
-    // Imagem → Google Vision OCR + Claude texto
-    campos = await parseComGoogleVision(buffer);
+    // Google Vision desabilitado (403 anterior) — usa Claude Vision direto
+    campos = await parseComClaude(buffer, mimeType);
   }
 
   if (!isRelatorioDesvio(campos)) {
@@ -737,11 +801,15 @@ async function startUserbot() {
   bot.startPolling({ restart: false });
   console.log('[BOT] Polling iniciado.');
 
+  const parserInfo = googleVisionEnabled
+    ? '🔍 Parser: Google Vision OCR + Claude texto'
+    : '🤖 Parser: Claude Vision (Google Vision não configurado)';
+
   await bot.sendMessage(MY_CHAT_ID,
     `🤖 *Desvios Bot iniciado!*\n` +
     `📋 ${Object.keys(desvios).length} desvios carregados\n` +
     `🔍 Monitorando: _${GROUP_NAME}_\n` +
-    `🤖 Parser: Claude Vision\n\n` +
+    `${parserInfo}\n\n` +
     `/desvios · /pendentes · /sincronizar 7\n` +
     `DD/MM/AAAA — desvios por data`,
     { parse_mode: 'Markdown' });
