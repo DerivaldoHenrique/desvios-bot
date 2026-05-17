@@ -16,9 +16,11 @@ const GROUP_NAME         = process.env.TELEGRAM_GROUP_NAME || 'OPERAÇÃO QSEMST
 const SENDER_ID          = process.env.TELEGRAM_SENDER_ID ? parseInt(process.env.TELEGRAM_SENDER_ID) : null;
 const BOT_TOKEN          = process.env.DESVIOS_BOT_TOKEN;
 const MY_CHAT_ID         = process.env.TELEGRAM_MY_CHAT_ID;
-const GOOGLE_VISION_KEY  = process.env.GOOGLE_VISION_API_KEY;
-const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const axios     = require('axios');
+// Aceita tanto GEMINI_API_KEY quanto GOOGLE_VISION_API_KEY (mesma chave do AI Studio)
+const GEMINI_KEY = process.env.GEMINI_API_KEY || process.env.GOOGLE_VISION_API_KEY;
+const GEMINI_MODEL = 'gemini-2.5-flash';
+const anthropic  = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+const axios      = require('axios');
 
 // ─── State (em memória, fonte da verdade = PostgreSQL) ────────────────────────
 // Chave = telegramMsgId (string) — único por mensagem, sem colisões de ID DI-XXXX
@@ -43,85 +45,93 @@ async function persistirDesvio(desvio, telegramMsgId) {
 // ─── Bot ──────────────────────────────────────────────────────────────────────
 const bot = new TelegramBot(BOT_TOKEN, { polling: false });
 
-// Flag desabilitada automaticamente após primeiro 403
-let googleVisionEnabled = !!GOOGLE_VISION_KEY;
+// Flag desabilitada automaticamente após erro de autenticação
+let geminiEnabled = !!GEMINI_KEY;
 
-// ─── Google Vision OCR + Claude parse (só texto — mais barato e preciso) ──────
-async function parseComGoogleVision(buffer) {
-  if (!GOOGLE_VISION_KEY || !googleVisionEnabled) throw new Error('VISION_DISABLED');
+// ─── Gemini Vision: lê imagem e extrai campos direto (1 chamada só) ───────────
+async function parseComGemini(buffer, mimeType) {
+  if (!GEMINI_KEY || !geminiEnabled) throw new Error('GEMINI_DISABLED');
 
-  let ocrResp;
+  const mediaType = (mimeType && mimeType.startsWith('image/')) ? mimeType : 'image/jpeg';
+  const base64    = buffer.toString('base64');
+
+  const PROMPT = `Analise este formulário "DIÁRIO DE BORDO" da empresa BENEL de desvio operacional de transporte.
+
+O formulário é uma tabela com duas colunas:
+- PERGUNTAS: coluna da ESQUERDA (fundo escuro, itens numerados 1 a 25)
+- RESPOSTA: coluna da DIREITA (fundo claro) — extraia SOMENTE estes valores
+
+MAPEAMENTO EXATO dos itens (número → campo JSON):
+- Cabeçalho direito: "Identificação: DI-XXXX" → id
+- Item 1  → evento (ex: FADIGA, DISTRAÇÃO, AJUDANTE DORMINDO)
+- Item 2  → placa (número/letras do veículo, ex: 0394-TIH2J75)
+- Item 3  → motorista (nome completo, leia cada letra com cuidado)
+- Item 4  → dataDesvio (converta para YYYY-MM-DD)
+- Item 5  → horario (HH:MM)
+- Item 6  → turno (NOTURNO ou DIURNO)
+- Item 7  → reincidente (SIM ou NÃO)
+- Item 8  → primeiraOcorrencia
+- Item 9  → unidade (valor esperado: SEACREST ES)
+- Item 10 → supervisor (valor esperado: DERIVALDO)
+- Item 11 → descumpriuCartilha (SIM ou NÃO)
+- Item 12 → evidenciaTratativa
+- Item 13 → gravidade (LEVE, MÉDIA, ALTA, GRAVE, GRAVÍSSIMA ou CRÍTICA)
+- Item 14 → observacao (texto completo)
+- Item 15 → descricao (descrição do evento, texto completo)
+- Item 16 → analise (análise completa, copie TODO o texto sem resumir)
+- Item 21 → contatoRealizado (SIM ou NÃO)
+- Cabeçalho: Respondente → respondente
+- Cabeçalho: Autor → autor
+- Cabeçalho: Data de Resposta → dataResposta
+
+REGRAS CRÍTICAS:
+1. Item 2 é a PLACA do veículo — nunca coloque o nome do evento aqui
+2. Item 3 é o NOME DO MOTORISTA — leia letra por letra, não confunda J com L, etc.
+3. Item 15 (descrição) e Item 16 (análise) são textos diferentes — não misture
+4. Se não for Diário de Bordo, retorne: {"id":null,"motorista":null,"evento":null}
+
+Retorne SOMENTE JSON válido sem markdown.`;
+
+  let resp;
   try {
-    // Passo 1: OCR preciso com Google Vision DOCUMENT_TEXT_DETECTION
-    ocrResp = await axios.post(
-      `https://vision.googleapis.com/v1/images:annotate?key=${GOOGLE_VISION_KEY}`,
+    resp = await axios.post(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${GEMINI_KEY}`,
       {
-        requests: [{
-          image: { content: buffer.toString('base64') },
-          features: [{ type: 'DOCUMENT_TEXT_DETECTION', maxResults: 1 }],
-          imageContext: { languageHints: ['pt-BR'] },
-        }],
+        contents: [{ parts: [
+          { inlineData: { mimeType: mediaType, data: base64 } },
+          { text: PROMPT },
+        ]}],
+        generationConfig: { temperature: 0, responseMimeType: 'application/json' },
       },
-      { timeout: 30000 }
+      { timeout: 45000 }
     );
   } catch (err) {
     const status = err.response?.status;
     if (status === 403 || status === 401) {
-      googleVisionEnabled = false;
-      console.error(`[VISION] HTTP ${status} — API não habilitada ou key inválida. Desabilitando Google Vision.`);
+      geminiEnabled = false;
+      console.error(`[GEMINI] HTTP ${status} — key inválida. Desabilitando.`);
       bot.sendMessage(MY_CHAT_ID,
-        `⚠️ Google Vision API retornou HTTP ${status}.\n` +
-        `Ative a Cloud Vision API em: console.cloud.google.com/apis/library/vision.googleapis.com\n` +
-        `Usando Claude Vision como fallback.`
+        `⚠️ Gemini API retornou HTTP ${status} — verifique a chave GEMINI_API_KEY.\nUsando Claude Vision como fallback.`
       ).catch(() => {});
-      throw new Error('VISION_AUTH_ERROR');
+      throw new Error('GEMINI_AUTH_ERROR');
+    }
+    if (status === 429) {
+      console.warn('[GEMINI] Rate limit (429) — fallback para Claude Vision.');
+      throw new Error('GEMINI_RATE_LIMIT');
     }
     throw err;
   }
 
-  const ocrResult = ocrResp.data.responses?.[0];
-  if (ocrResult?.error) throw new Error(`Google Vision: ${ocrResult.error.message}`);
+  const text = resp.data.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || '';
+  const clean = text.replace(/^```json?\n?/, '').replace(/\n?```$/, '').trim();
 
-  const ocrText = ocrResult?.fullTextAnnotation?.text || '';
-  if (ocrText.trim().length < 30) {
-    console.log('[VISION] Texto muito curto, ignorando.');
-    throw new Error('NÃO_RELATORIO');
-  }
-  console.log(`[VISION] OCR: ${ocrText.length} chars`);
-
-  // Passo 2: Claude extrai campos estruturados do texto OCR (sem imagem = muito mais barato)
-  const parseResp = await anthropic.messages.create({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 1024,
-    messages: [{
-      role: 'user',
-      content: `Texto extraído via OCR de um formulário "DIÁRIO DE BORDO" de desvio operacional.
-O formulário é uma tabela numerada: cada item tem um número (1-25), uma PERGUNTA e uma RESPOSTA.
-O cabeçalho tem: Identificação (ID tipo DI-XXXX), Autor, Respondente, Data de Resposta.
-
-VALORES FIXOS desta empresa (substitua se o OCR errou):
-- Item 9 Unidade = "SEACREST ES"
-- Item 10 Supervisor = "DERIVALDO"
-
-Retorne SOMENTE JSON sem markdown:
-{"id":"DI-XXXX","evento":"item1","placa":"item2","motorista":"item3","dataDesvio":"YYYY-MM-DD","horario":"HH:MM","turno":"NOTURNO|DIURNO","reincidente":"SIM|NÃO","primeiraOcorrencia":"item8","unidade":"item9","supervisor":"item10","descumpriuCartilha":"SIM|NÃO","evidenciaTratativa":"item12","gravidade":"LEVE|MÉDIA|ALTA|GRAVE|GRAVÍSSIMA|CRÍTICA","observacao":"item14","descricao":"item15","analise":"item16 completo","contatoRealizado":"SIM|NÃO","respondente":"cabeçalho","autor":"cabeçalho","dataResposta":"cabeçalho"}
-
-Se não for Diário de Bordo: {"id":null,"motorista":null,"evento":null}
-
-TEXTO OCR:
-${ocrText.slice(0, 4000)}`,
-    }],
-  });
-
-  const raw = parseResp.content[0].text.trim()
-    .replace(/^```json?\n?/, '').replace(/\n?```$/, '').trim();
-
-  if (!raw.startsWith('{')) {
-    console.log('[PARSE] Não-JSON:', raw.slice(0, 80));
+  if (!clean.startsWith('{')) {
+    console.log('[GEMINI] Não-JSON:', clean.slice(0, 80));
     throw new Error('NÃO_RELATORIO');
   }
 
-  return JSON.parse(raw);
+  console.log('[GEMINI] Extração OK');
+  return JSON.parse(clean);
 }
 
 // ─── Claude Vision (fallback quando Google Vision não disponível) ─────────────
@@ -321,20 +331,21 @@ async function processarMidia(buffer, mimeType, origem) {
 
   if (isPdf) {
     campos = await parseComPdfParse(buffer);
-  } else if (googleVisionEnabled) {
-    // Tenta Google Vision OCR → Claude texto (mais barato e preciso)
+  } else if (geminiEnabled) {
+    // Tenta Gemini Vision (lê imagem + extrai JSON em 1 chamada)
     try {
-      campos = await parseComGoogleVision(buffer);
+      campos = await parseComGemini(buffer, mimeType);
     } catch (err) {
-      if (err.message === 'VISION_AUTH_ERROR' || err.message === 'VISION_DISABLED') {
-        console.warn('[PARSE] Fallback para Claude Vision...');
+      const fallbackErros = ['GEMINI_AUTH_ERROR', 'GEMINI_RATE_LIMIT', 'GEMINI_DISABLED'];
+      if (fallbackErros.includes(err.message)) {
+        console.warn(`[PARSE] ${err.message} — fallback para Claude Vision...`);
         campos = await parseComClaude(buffer, mimeType);
       } else {
         throw err;
       }
     }
   } else {
-    // Google Vision desabilitado (403 anterior) — usa Claude Vision direto
+    // Gemini desabilitado (erro anterior) — usa Claude Vision direto
     campos = await parseComClaude(buffer, mimeType);
   }
 
@@ -801,9 +812,9 @@ async function startUserbot() {
   bot.startPolling({ restart: false });
   console.log('[BOT] Polling iniciado.');
 
-  const parserInfo = googleVisionEnabled
-    ? '🔍 Parser: Google Vision OCR + Claude texto'
-    : '🤖 Parser: Claude Vision (Google Vision não configurado)';
+  const parserInfo = geminiEnabled
+    ? `🔍 Parser: Gemini Vision (${GEMINI_MODEL})`
+    : '🤖 Parser: Claude Vision (Gemini não configurado)';
 
   await bot.sendMessage(MY_CHAT_ID,
     `🤖 *Desvios Bot iniciado!*\n` +

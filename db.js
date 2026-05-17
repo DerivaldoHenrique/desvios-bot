@@ -213,36 +213,57 @@ async function buscarColaborador(nome) {
   if (!nome || nome === '—' || nome.length < 4) return null;
 
   try {
-    // Tenta com pg_trgm similarity (melhor resultado)
+    // 1. Similarity do nome completo (pg_trgm)
     let r = await neonPool.query(`
-      SELECT nome, documento
+      SELECT nome, documento,
+             similarity(lower(nome), lower($1)) AS sim
       FROM cadastro_pessoas
       WHERE similarity(lower(nome), lower($1)) > 0.35
-      ORDER BY similarity(lower(nome), lower($1)) DESC
+      ORDER BY sim DESC
       LIMIT 1
     `, [nome]).catch(() => null);
 
     if (r?.rowCount > 0) {
-      console.log(`[CADASTRO] Match (trgm): "${nome}" → "${r.rows[0].nome}"`);
+      console.log(`[CADASTRO] Match trgm "${nome}" → "${r.rows[0].nome}" (sim=${r.rows[0].sim?.toFixed(2)})`);
       return r.rows[0];
     }
 
-    // Fallback: busca pelas 2 primeiras palavras do nome (ignora erros do OCR no resto)
-    const palavras = nome.trim().split(/\s+/).filter(p => p.length > 3).slice(0, 2);
-    if (palavras.length === 0) return null;
+    // 2. Tenta com o sobrenome (últimas 2 palavras) — resiste a erros na primeira letra do prenome
+    const partes = nome.trim().split(/\s+/).filter(p => p.length > 2);
+    if (partes.length >= 2) {
+      const sobrenome = partes.slice(-2).join(' ');  // ex: "CONCEIÇÃO GOMES"
+      r = await neonPool.query(`
+        SELECT nome, documento,
+               similarity(lower(nome), lower($1)) AS sim
+        FROM cadastro_pessoas
+        WHERE lower(nome) LIKE lower($2)
+           OR similarity(lower(nome), lower($1)) > 0.45
+        ORDER BY sim DESC
+        LIMIT 1
+      `, [sobrenome, `%${sobrenome}%`]).catch(() => null);
 
-    r = await neonPool.query(
-      `SELECT nome, documento FROM cadastro_pessoas
-       WHERE ${palavras.map((_, i) => `lower(nome) LIKE lower($${i+1})`).join(' AND ')}
-       LIMIT 1`,
-      palavras.map(p => `%${p}%`)
-    );
+      if (r?.rowCount > 0) {
+        console.log(`[CADASTRO] Match sobrenome "${sobrenome}" → "${r.rows[0].nome}"`);
+        return r.rows[0];
+      }
 
-    if (r.rowCount > 0) {
-      console.log(`[CADASTRO] Match (LIKE): "${nome}" → "${r.rows[0].nome}"`);
-      return r.rows[0];
+      // 3. Fallback: qualquer palavra do nome com mais de 5 letras (última palavra longa)
+      const palavraLonga = partes.filter(p => p.length >= 5).pop();
+      if (palavraLonga) {
+        r = await neonPool.query(
+          `SELECT nome, documento FROM cadastro_pessoas
+           WHERE lower(nome) LIKE lower($1) LIMIT 1`,
+          [`%${palavraLonga}%`]
+        ).catch(() => null);
+
+        if (r?.rowCount > 0) {
+          console.log(`[CADASTRO] Match parcial "${palavraLonga}" → "${r.rows[0].nome}"`);
+          return r.rows[0];
+        }
+      }
     }
 
+    console.log(`[CADASTRO] Nenhum match para "${nome}"`);
     return null;
   } catch (err) {
     console.error('[CADASTRO] Erro:', err.message);
