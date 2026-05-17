@@ -47,8 +47,8 @@ async function parseComClaude(buffer, mimeType) {
   const mediaType = (mimeType && mimeType.startsWith('image/')) ? mimeType : 'image/jpeg';
 
   const response = await anthropic.messages.create({
-    model: 'claude-haiku-4-5',
-    max_tokens: 1024,
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 2048,
     messages: [{
       role: 'user',
       content: [
@@ -60,39 +60,45 @@ async function parseComClaude(buffer, mimeType) {
           type: 'text',
           text: `Analise esta imagem de um relatório "DIÁRIO DE BORDO" de desvio operacional de empresa de transporte.
 
-A tabela tem duas colunas principais: PERGUNTAS (esquerda) e RESPOSTA (direita).
-Extraia SEMPRE o valor da coluna RESPOSTA, nunca o texto da coluna PERGUNTAS.
+A tabela tem duas colunas: PERGUNTAS (coluna esquerda, fundo escuro) e RESPOSTA (coluna direita, fundo claro).
+Leia SOMENTE a coluna RESPOSTA. Nunca copie texto da coluna PERGUNTAS.
 
-Retorne SOMENTE JSON válido, sem markdown:
+VALORES DE REFERÊNCIA conhecidos desta empresa (use para corrigir leituras próximas):
+- Unidade: "SEACREST ES" (não SEACHERS, SEACRES, SEACRESTS, etc.)
+- Supervisor: "DERIVALDO" (não DERRIVALDO, DERIVADOR, DERRIVAL, etc.)
+- Turno: "NOTURNO" ou "DIURNO"
+- Reincidente: "SIM" ou "NÃO"
+
+Retorne SOMENTE JSON válido, sem markdown, sem comentários:
 
 {
-  "id": "Identificação no canto superior direito — ex: DI-0001 (copie exatamente, incluindo todos os dígitos)",
-  "evento": "RESPOSTA do item 1 (ex: FADIGA, DISTRAÇÃO, SONOLÊNCIA — NÃO escreva 'EVENTO 1')",
-  "placa": "RESPOSTA do item 2 — placa exata como aparece (ex: 12118-THY9D46)",
-  "motorista": "RESPOSTA do item 3 — nome completo exato",
+  "id": "string no canto superior direito após 'Identificação:' — ex: DI-0001 — copie todos os dígitos",
+  "evento": "RESPOSTA do item 1 — tipo do desvio (ex: FADIGA, DISTRAÇÃO, SONOLÊNCIA, AJUDANTE DORMINDO)",
+  "placa": "RESPOSTA do item 2 — placa exata (ex: 12118-THY9D46)",
+  "motorista": "RESPOSTA do item 3 — nome completo do motorista ou ajudante",
   "dataDesvio": "RESPOSTA do item 4 — formato YYYY-MM-DD",
   "horario": "RESPOSTA do item 5 — formato HH:MM",
   "turno": "RESPOSTA do item 6 — NOTURNO ou DIURNO",
   "reincidente": "RESPOSTA do item 7 — SIM ou NÃO",
   "primeiraOcorrencia": "RESPOSTA do item 8 se visível, senão null",
-  "unidade": "RESPOSTA do item 9",
-  "supervisor": "RESPOSTA do item 10 — nome exato",
+  "unidade": "RESPOSTA do item 9 — use valor de referência se próximo",
+  "supervisor": "RESPOSTA do item 10 — use valor de referência se próximo",
   "descumpriuCartilha": "RESPOSTA do item 11 — SIM ou NÃO",
   "evidenciaTratativa": "RESPOSTA do item 12",
   "gravidade": "RESPOSTA do item 13 — LEVE, MÉDIA, ALTA, GRAVE, GRAVÍSSIMA ou CRÍTICA",
-  "observacao": "RESPOSTA do item 14",
-  "descricao": "RESPOSTA do item 15 — descrição do evento",
-  "analise": "RESPOSTA do item 16 — texto completo da análise, copiado fielmente",
-  "contatoRealizado": "RESPOSTA do item 21 se visível",
-  "respondente": "Respondente no cabeçalho",
-  "autor": "Autor no cabeçalho",
-  "dataResposta": "Data de Resposta no cabeçalho — ex: 11/05/2026, 15:54"
+  "observacao": "RESPOSTA do item 14 — texto completo",
+  "descricao": "RESPOSTA do item 15 — descrição do evento, texto completo",
+  "analise": "RESPOSTA do item 16 — análise completa, copie fielmente sem resumir",
+  "contatoRealizado": "RESPOSTA do item 21 se visível — SIM ou NÃO",
+  "respondente": "valor do campo Respondente no cabeçalho",
+  "autor": "valor do campo Autor no cabeçalho",
+  "dataResposta": "valor do campo Data de Resposta no cabeçalho — ex: 11/05/2026, 15:54"
 }
 
-IMPORTANTE:
-- Copie os textos exatamente como estão na imagem, sem corrigir ou resumir
-- Se um campo não estiver visível, use null
-- Se a imagem não for um Diário de Bordo, retorne: {"id":null,"motorista":null,"evento":null}`,
+REGRAS:
+- Leia caractere por caractere o nome do motorista — não invente nem complete
+- Se a imagem não for um Diário de Bordo, retorne: {"id":null,"motorista":null,"evento":null}
+- Campos não visíveis: use null`,
         },
       ],
     }],
@@ -137,6 +143,87 @@ async function parseComPdfParse(buffer) {
     respondente: text.match(/Respondente:\s*([^\n]+)/i)?.[1]?.trim() || null,
     dataResposta: text.match(/Data de Resposta:\s*([^\n]+)/i)?.[1]?.trim() || null,
   };
+}
+
+// ─── Normaliza campos com valores conhecidos ──────────────────────────────────
+// Distância de Levenshtein simples para detectar erros de OCR
+function levenshtein(a, b) {
+  const m = a.length, n = b.length;
+  const dp = Array.from({ length: m + 1 }, (_, i) => [i, ...Array(n).fill(0)]);
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+  for (let i = 1; i <= m; i++)
+    for (let j = 1; j <= n; j++)
+      dp[i][j] = a[i-1] === b[j-1]
+        ? dp[i-1][j-1]
+        : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+  return dp[m][n];
+}
+
+// Corrige valor para o mais próximo de uma lista de valores conhecidos
+// Só substitui se a distância for pequena (≤ maxDist) e o valor correto for bem mais próximo
+function corrigirParaConhecido(valor, conhecidos, maxDist = 3) {
+  if (!valor) return valor;
+  const upper = valor.trim().toUpperCase();
+  let melhor = null, melhorDist = Infinity;
+  for (const c of conhecidos) {
+    const d = levenshtein(upper, c.toUpperCase());
+    if (d < melhorDist) { melhorDist = d; melhor = c; }
+  }
+  if (melhorDist <= maxDist && melhorDist > 0) {
+    console.log(`[NORM] "${valor}" → "${melhor}" (dist=${melhorDist})`);
+    return melhor;
+  }
+  return valor;
+}
+
+const UNIDADES_CONHECIDAS = [
+  'SEACREST ES',
+];
+
+const SUPERVISORES_CONHECIDOS = [
+  'DERIVALDO',
+];
+
+function normalizarCampos(campos) {
+  const c = { ...campos };
+
+  // Unidade — corrige erros próximos
+  if (c.unidade) {
+    c.unidade = corrigirParaConhecido(c.unidade, UNIDADES_CONHECIDAS, 4);
+  }
+
+  // Supervisor — corrige erros de digitação/OCR
+  if (c.supervisor) {
+    // Remove duplicatas de letras comuns em erros OCR (ex: DERRIVALDO → DERIVALDO)
+    const limpo = c.supervisor.trim().toUpperCase();
+    c.supervisor = corrigirParaConhecido(limpo, SUPERVISORES_CONHECIDOS, 4);
+  }
+
+  // Turno — normaliza
+  if (c.turno) {
+    const t = c.turno.trim().toUpperCase();
+    if (t.includes('NOTU')) c.turno = 'NOTURNO';
+    else if (t.includes('DIU')) c.turno = 'DIURNO';
+  }
+
+  // SIM/NÃO — normaliza variações
+  for (const key of ['reincidente', 'descumpriuCartilha', 'contatoRealizado']) {
+    if (!c[key]) continue;
+    const v = c[key].trim().toUpperCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+    if (v === 'SIM' || v === 'S' || v === 'YES') c[key] = 'SIM';
+    else if (v === 'NAO' || v === 'N' || v === 'NO' || v === 'NÃO') c[key] = 'NÃO';
+  }
+
+  // Gravidade — normaliza variações
+  if (c.gravidade) {
+    const g = c.gravidade.trim().toUpperCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
+    const gravidades = ['GRAVISSIMA', 'CRITICA', 'GRAVE', 'ALTA', 'MEDIA', 'MODERADA', 'LEVE', 'BAIXA'];
+    const map = { GRAVISSIMA: 'GRAVÍSSIMA', CRITICA: 'CRÍTICA', MEDIA: 'MÉDIA' };
+    const match = gravidades.find(gr => g.includes(gr));
+    if (match) c.gravidade = map[match] || match;
+  }
+
+  return c;
 }
 
 // ─── Detecta se é relatório de desvio ────────────────────────────────────────
@@ -203,7 +290,7 @@ async function processarMidia(buffer, mimeType, origem) {
     return null;
   }
 
-  return montarDesvio(campos);
+  return montarDesvio(normalizarCampos(campos));
 }
 
 // ─── Emojis ───────────────────────────────────────────────────────────────────
