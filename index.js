@@ -356,15 +356,17 @@ async function processarMidia(buffer, mimeType, origem) {
 
   const desvio = montarDesvio(normalizarCampos(campos));
 
-  // Enriquece com dados do cadastro: corrige nome e traz matrícula
+  // Enriquece com dados do cadastro: traz matrícula; só corrige nome se confiança alta
   try {
     const colab = await db.buscarColaborador(desvio.motorista);
     if (colab) {
-      if (colab.nome) {
-        console.log(`[CADASTRO] Nome corrigido: "${desvio.motorista}" → "${colab.nome}"`);
-        desvio.motorista = colab.nome;
-      }
       desvio.matricula = colab.documento || '—';
+      if (colab.confianca === 'alta' && colab.nome) {
+        console.log(`[CADASTRO] Nome corrigido (alta): "${desvio.motorista}" → "${colab.nome}"`);
+        desvio.motorista = colab.nome;
+      } else if (colab.nome) {
+        console.log(`[CADASTRO] Matrícula OK, nome mantido (${colab.confianca}): "${desvio.motorista}" doc=${colab.documento}`);
+      }
     }
   } catch (err) {
     console.error('[CADASTRO] Erro na busca:', err.message);

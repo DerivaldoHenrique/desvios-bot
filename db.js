@@ -208,62 +208,70 @@ async function loadAllDesvios() {
 
 // ─── Colaboradores (banco principal Ponto/Neon) ───────────────────────────────
 
+// Remove acentos em JS para comparação sem depender de unaccent no DB
+function semAcento(s) {
+  return (s || '').normalize('NFD').replace(/[̀-ͯ]/g, '').toLowerCase();
+}
+
 async function buscarColaborador(nome) {
   if (!neonPool) return null;
   if (!nome || nome === '—' || nome.length < 4) return null;
 
+  const nomeNorm = semAcento(nome);
+
   try {
-    // 1. Similarity do nome completo (pg_trgm)
+    // 1. unaccent + trgm — melhor para nomes com variação de acento (CONCEICAO vs CONCEIÇÃO)
     let r = await neonPool.query(`
+      SELECT nome, documento,
+             similarity(unaccent(lower(nome)), $1) AS sim
+      FROM cadastro_pessoas
+      WHERE similarity(unaccent(lower(nome)), $1) > 0.35
+      ORDER BY sim DESC
+      LIMIT 1
+    `, [nomeNorm]).catch(() => null);
+
+    if (r?.rowCount > 0) {
+      const row = r.rows[0];
+      const pct = Math.round((row.sim || 0) * 100);
+      console.log(`[CADASTRO] trgm+unaccent "${nome}" → "${row.nome}" (${pct}%)`);
+      return { nome: row.nome, documento: row.documento, confianca: pct >= 55 ? 'alta' : 'media' };
+    }
+
+    // 2. trgm sem unaccent (fallback se extensão não disponível)
+    r = await neonPool.query(`
       SELECT nome, documento,
              similarity(lower(nome), lower($1)) AS sim
       FROM cadastro_pessoas
-      WHERE similarity(lower(nome), lower($1)) > 0.35
+      WHERE similarity(lower(nome), lower($1)) > 0.30
       ORDER BY sim DESC
       LIMIT 1
     `, [nome]).catch(() => null);
 
     if (r?.rowCount > 0) {
-      console.log(`[CADASTRO] Match trgm "${nome}" → "${r.rows[0].nome}" (sim=${r.rows[0].sim?.toFixed(2)})`);
-      return r.rows[0];
+      const row = r.rows[0];
+      const pct = Math.round((row.sim || 0) * 100);
+      console.log(`[CADASTRO] trgm "${nome}" → "${row.nome}" (${pct}%)`);
+      return { nome: row.nome, documento: row.documento, confianca: pct >= 50 ? 'alta' : 'media' };
     }
 
-    // 2. Tenta com o sobrenome (últimas 2 palavras) — resiste a erros na primeira letra do prenome
-    const partes = nome.trim().split(/\s+/).filter(p => p.length > 2);
-    if (partes.length >= 2) {
-      const sobrenome = partes.slice(-2).join(' ');  // ex: "CONCEIÇÃO GOMES"
-      r = await neonPool.query(`
-        SELECT nome, documento,
-               similarity(lower(nome), lower($1)) AS sim
-        FROM cadastro_pessoas
-        WHERE lower(nome) LIKE lower($2)
-           OR similarity(lower(nome), lower($1)) > 0.45
-        ORDER BY sim DESC
-        LIMIT 1
-      `, [sobrenome, `%${sobrenome}%`]).catch(() => null);
+    // 3. LIKE com 2 palavras longas consecutivas — só usa se resultado ÚNICO no banco
+    //    Ex: "CONCEICAO GOMES" → só 1 pessoa → confiança média, não substitui nome
+    const partes = nomeNorm.split(/\s+/).filter(p => p.length >= 5);
+    for (let i = partes.length - 1; i >= 1; i--) {
+      const r3 = await neonPool.query(
+        `SELECT nome, documento FROM cadastro_pessoas
+         WHERE unaccent(lower(nome)) LIKE $1 LIMIT 2`,
+        [`%${partes[i-1]}%${partes[i]}%`]
+      ).catch(() => null);
 
-      if (r?.rowCount > 0) {
-        console.log(`[CADASTRO] Match sobrenome "${sobrenome}" → "${r.rows[0].nome}"`);
-        return r.rows[0];
-      }
-
-      // 3. Fallback: qualquer palavra do nome com mais de 5 letras (última palavra longa)
-      const palavraLonga = partes.filter(p => p.length >= 5).pop();
-      if (palavraLonga) {
-        r = await neonPool.query(
-          `SELECT nome, documento FROM cadastro_pessoas
-           WHERE lower(nome) LIKE lower($1) LIMIT 1`,
-          [`%${palavraLonga}%`]
-        ).catch(() => null);
-
-        if (r?.rowCount > 0) {
-          console.log(`[CADASTRO] Match parcial "${palavraLonga}" → "${r.rows[0].nome}"`);
-          return r.rows[0];
-        }
+      if (r3?.rowCount === 1) {
+        console.log(`[CADASTRO] LIKE único "${partes[i-1]} ${partes[i]}" → "${r3.rows[0].nome}"`);
+        // Confiança baixa: traz matrícula mas NÃO substitui o nome
+        return { nome: r3.rows[0].nome, documento: r3.rows[0].documento, confianca: 'baixa' };
       }
     }
 
-    console.log(`[CADASTRO] Nenhum match para "${nome}"`);
+    console.log(`[CADASTRO] Sem match para "${nome}"`);
     return null;
   } catch (err) {
     console.error('[CADASTRO] Erro:', err.message);
